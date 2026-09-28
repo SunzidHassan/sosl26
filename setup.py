@@ -15,7 +15,7 @@ setup(
     zip_safe=True,
     maintainer='ubuntu',
     maintainer_email='sunzidhassan@gmail.com',
-    description='TODO: Package description',
+    description='Semantic odor source localization (olfaction + vision fusion) on TurtleBot4',
     license='TODO: License declaration',
     extras_require={
         'test': [
@@ -24,6 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'sosl_tb4 = sosl26.sOSL_tb4_main:main',
         ],
     },
 )

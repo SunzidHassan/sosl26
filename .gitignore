@@ -1,3 +1,5 @@
 # Log files
 *.log
 __pycache__/
+# Experiment outputs
+save/
