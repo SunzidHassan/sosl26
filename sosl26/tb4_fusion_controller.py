@@ -11,8 +11,6 @@ TB4 counterpart of ControlAlgorithms/Fusion/fusion_controller.py. Every
      trajectory log (same files as the AI2-THOR runs),
   6. calls navigate(), which is currently a no-op (drive with teleop).
 
-See sOSL_tb4Functions.py for the ai2thor <-> ROS axis convention
-(robot_z / z_points == ROS map y).
 """
 
 import json
