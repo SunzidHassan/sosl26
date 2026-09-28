@@ -88,11 +88,12 @@ class ExperimentConfig:
     psi_deg: float = 0.0
     sigma_noise: float = 1.5
     use_simulated_olfaction: bool = False      # replace /olfaction by gaussian_plume(source_position)
-    # The plume model predicts ~0 far from the source, but real sensors read an ambient baseline.
-    # None: use raw readings | float: subtract this value | 'auto': subtract the median of the
-    # first `olfaction_baseline_samples` /olfaction messages (start the robot away from the source).
-    olfaction_baseline: Optional[object] = 'auto'
-    olfaction_baseline_samples: int = 10
+    # Linear rescaling of raw /olfaction readings before the Bayesian update:
+    #   rescaled = olfaction_rescale_to * (raw - olfaction_min_conc) / (olfaction_max_conc - olfaction_min_conc)
+    # (min -> 0, max -> olfaction_rescale_to; not clipped). None for both = use raw readings.
+    olfaction_min_conc: Optional[float] = None
+    olfaction_max_conc: Optional[float] = None
+    olfaction_rescale_to: float = 100.0
 
     # --- Map / grid ---
     grid_step: float = 0.25
@@ -149,6 +150,10 @@ class TB4BaseController(Node):
         self.cfg = cfg
         self.save_dir = save_dir
         self.goal_phrase = cfg.resolved_goal_phrase()
+        if (cfg.olfaction_min_conc is None) != (cfg.olfaction_max_conc is None):
+            raise ValueError("Set both olfaction_min_conc and olfaction_max_conc, or neither.")
+        if cfg.olfaction_min_conc is not None and cfg.olfaction_max_conc == cfg.olfaction_min_conc:
+            raise ValueError("olfaction_max_conc must differ from olfaction_min_conc.")
 
         # --- TF ---
         self.tf_buffer = Buffer()
@@ -180,7 +185,6 @@ class TB4BaseController(Node):
         self.olfactionChemicalConc = 0.0
         self.olfaction_received = False
         self.olfaction_raw = []
-        self.olfaction_baseline = None
         self.map_msg = None
         self.latest_annotated = None
 
@@ -399,7 +403,6 @@ class TB4BaseController(Node):
             "grid_bounds": list(map(float, g.bounds)),
             "x_points": g.x_points.tolist(),
             "z_points(map_y)": g.z_points.tolist(),
-            "olfaction_baseline": self.olfaction_baseline,
             "H_max": float(self.H_max),
             "entropy_threshold": float(self.entropy_threshold),
         }
@@ -434,9 +437,6 @@ class TB4BaseController(Node):
             self.get_logger().warn(f"Waiting for: {', '.join(missing)}", throttle_duration_sec=2.0)
             return
 
-        if self.olfaction_baseline is None and not self.calibrate_baseline():
-            return
-
         if self.grid is None and not self.setup_search(pose):
             return
 
@@ -450,29 +450,16 @@ class TB4BaseController(Node):
             self.get_logger().info(f"Step threshold {cfg.step_threshold} reached. Ending run.")
             self.done = True
 
-    def calibrate_baseline(self):
-        """Sets self.olfaction_baseline; returns False while still collecting 'auto' samples."""
+    def rescale_concentration(self, raw):
+        """Maps a raw reading linearly so olfaction_min_conc -> 0 and olfaction_max_conc -> olfaction_rescale_to."""
         cfg = self.cfg
-        if cfg.use_simulated_olfaction or cfg.olfaction_baseline is None:
-            self.olfaction_baseline = 0.0
-        elif cfg.olfaction_baseline == 'auto':
-            n = len(self.olfaction_raw)
-            if n < cfg.olfaction_baseline_samples:
-                self.get_logger().info(
-                    f"Calibrating olfaction baseline: {n}/{cfg.olfaction_baseline_samples} readings",
-                    throttle_duration_sec=2.0)
-                return False
-            readings = np.array([r["chemicalConc"] for r in self.olfaction_raw[:cfg.olfaction_baseline_samples]])
-            self.olfaction_baseline = float(np.median(readings))
-            self.get_logger().info(
-                f"Olfaction baseline {self.olfaction_baseline:.2f} (median of {len(readings)} readings, "
-                f"std {readings.std():.2f}; sigma_noise is {cfg.sigma_noise})")
-        else:
-            self.olfaction_baseline = float(cfg.olfaction_baseline)
-        return True
+        if cfg.olfaction_min_conc is None or cfg.olfaction_max_conc is None:
+            return raw
+        a = cfg.olfaction_rescale_to / (cfg.olfaction_max_conc - cfg.olfaction_min_conc)
+        return a * (raw - cfg.olfaction_min_conc)
 
     def read_olfaction(self, robot_x, robot_z):
-        """(raw concentration, baseline-corrected concentration, wind_direction, wind_speed)."""
+        """(raw concentration, rescaled concentration, wind_direction, wind_speed)."""
         cfg = self.cfg
         if cfg.use_simulated_olfaction and cfg.source_position is not None:
             conc = gaussian_plume(robot_x, robot_z, tuple(cfg.source_position),
@@ -480,7 +467,7 @@ class TB4BaseController(Node):
             conc += np.random.normal(0, cfg.sigma_noise)
             return conc, conc, 0.0, 0.0
         raw = self.olfactionChemicalConc
-        return raw, max(raw - self.olfaction_baseline, 0.0), self.olfactionWindDirection, self.olfactionWindSpeed
+        return raw, self.rescale_concentration(raw), self.olfactionWindDirection, self.olfactionWindSpeed
 
     def run_step(self, pose):
         cfg = self.cfg
@@ -555,9 +542,8 @@ class TB4BaseController(Node):
             "target_coord_estimation_error": target_error,
             "olfactory_max_x": float(olfactory_max_xz[0]),
             "olfactory_max_z": float(olfactory_max_xz[1]),
-            "concentration": current_odor_concentration,         # baseline-corrected, used by the Bayesian update
+            "concentration": current_odor_concentration,         # rescaled, used by the Bayesian update
             "raw_concentration": raw_concentration,
-            "olfaction_baseline": self.olfaction_baseline,
             "wind_direction": wind_direction,
             "wind_speed": wind_speed,
             "gt_distance_from_source": gt_distance,
