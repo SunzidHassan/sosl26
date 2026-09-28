@@ -42,6 +42,21 @@ def next_run_dir(base_save_dir):
     return run_serial, run_dir
 
 
+def resolve_concentration(value):
+    """A number, or the mean chemicalConc (rounded to 2 decimals) of an olfaction_data.csv."""
+    if value is None or isinstance(value, (int, float)):
+        return value
+    import pandas as pd
+    candidates = [value] if os.path.isabs(value) else [
+        os.path.join(os.path.dirname(default_save_root()), value), os.path.join(os.getcwd(), value)]
+    path = next((c for c in candidates if os.path.isfile(c)), None)
+    if path is None:
+        raise FileNotFoundError(f"Concentration CSV not found (tried {candidates}); set a number or fix the path.")
+    mean = round(float(pd.read_csv(path)['chemicalConc'].mean()), 2)
+    print(f"Average concentration of {path}: {mean}")
+    return mean
+
+
 # ==========================
 # MAIN FUNCTION
 # ==========================
@@ -60,7 +75,12 @@ def main(args=None):
     q_s = 12.8
     D = 0.01
     tau = 1000.0
-    sigma_noise = 60
+    sigma_noise = 60                 # std of the sensor noise, in rescaled units
+
+    # Rescaling of raw /olfaction readings: min -> 0, max -> 100 (same as the offline a * raw + b).
+    # Each can be a number or the path of an olfaction_data.csv, whose mean chemicalConc is used.
+    olfaction_max_conc = 'testData/2026-09-15_sensorDump_high_2/olfaction_data.csv'
+    olfaction_min_conc = 480         # dummy min (measured: 'testData/2026-09-15_sensorDump_low/olfaction_data.csv')
 
     # Map / ground truth (ROS map frame)
     map_bounds = None                # (x_min, x_max, y_min, y_max); None = use /map
@@ -98,6 +118,8 @@ def main(args=None):
         D=D,
         tau=tau,
         sigma_noise=sigma_noise,
+        olfaction_min_conc=resolve_concentration(olfaction_min_conc),
+        olfaction_max_conc=resolve_concentration(olfaction_max_conc),
         map_bounds=map_bounds,
         source_position=source_position,
         yolo_conf=yolo_conf,

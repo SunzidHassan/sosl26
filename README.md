@@ -49,6 +49,17 @@ depth (`/oakd/stereo/image_raw/compressedDepth`) messages. It then updates the B
 `navKnowledge` with `add_goal_similarity`. It calls `navigate()`, which does nothing yet, and it never publishes
 `/cmd_vel`, so teleop keeps control.
 
+## Olfactory readings
+
+Before the Bayesian update, raw `/olfaction` concentrations are rescaled linearly, as in the offline mapping:
+
+`rescaled = 100 · (raw − min) / (max − min)`
+
+- Set `olfaction_min_conc` and `olfaction_max_conc` in `main()`. Each is a number or the path of an `olfaction_data.csv`, in which case its mean `chemicalConc` is used.
+- Values are not clipped, so readings below `min` become negative.
+- Leave both `None` to use raw readings.
+- `trajectory_log.csv` logs `raw_concentration` and the rescaled `concentration`.
+
 ## Outputs
 
 `<sosl26>/save/save_F_{Odor}_{vision_mode}/...` or `save_O_{Odor}/...`, then `{entropy_frac}/{run}/` (with `--symlink-install`; otherwise `./save`):

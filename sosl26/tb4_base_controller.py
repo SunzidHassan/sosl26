@@ -88,6 +88,12 @@ class ExperimentConfig:
     psi_deg: float = 0.0
     sigma_noise: float = 1.5
     use_simulated_olfaction: bool = False      # replace /olfaction by gaussian_plume(source_position)
+    # Linear rescaling of raw /olfaction readings before the Bayesian update:
+    #   rescaled = olfaction_rescale_to * (raw - olfaction_min_conc) / (olfaction_max_conc - olfaction_min_conc)
+    # (min -> 0, max -> olfaction_rescale_to; not clipped). None for both = use raw readings.
+    olfaction_min_conc: Optional[float] = None
+    olfaction_max_conc: Optional[float] = None
+    olfaction_rescale_to: float = 100.0
 
     # --- Map / grid ---
     grid_step: float = 0.25
@@ -144,6 +150,10 @@ class TB4BaseController(Node):
         self.cfg = cfg
         self.save_dir = save_dir
         self.goal_phrase = cfg.resolved_goal_phrase()
+        if (cfg.olfaction_min_conc is None) != (cfg.olfaction_max_conc is None):
+            raise ValueError("Set both olfaction_min_conc and olfaction_max_conc, or neither.")
+        if cfg.olfaction_min_conc is not None and cfg.olfaction_max_conc == cfg.olfaction_min_conc:
+            raise ValueError("olfaction_max_conc must differ from olfaction_min_conc.")
 
         # --- TF ---
         self.tf_buffer = Buffer()
@@ -440,14 +450,24 @@ class TB4BaseController(Node):
             self.get_logger().info(f"Step threshold {cfg.step_threshold} reached. Ending run.")
             self.done = True
 
+    def rescale_concentration(self, raw):
+        """Maps a raw reading linearly so olfaction_min_conc -> 0 and olfaction_max_conc -> olfaction_rescale_to."""
+        cfg = self.cfg
+        if cfg.olfaction_min_conc is None or cfg.olfaction_max_conc is None:
+            return raw
+        a = cfg.olfaction_rescale_to / (cfg.olfaction_max_conc - cfg.olfaction_min_conc)
+        return a * (raw - cfg.olfaction_min_conc)
+
     def read_olfaction(self, robot_x, robot_z):
-        """(concentration, wind_direction, wind_speed) for this step."""
+        """(raw concentration, rescaled concentration, wind_direction, wind_speed)."""
         cfg = self.cfg
         if cfg.use_simulated_olfaction and cfg.source_position is not None:
             conc = gaussian_plume(robot_x, robot_z, tuple(cfg.source_position),
                                   q_s=cfg.q_s, D=cfg.D, U=cfg.U, tau=cfg.tau, psi_deg=cfg.psi_deg)
-            return conc + np.random.normal(0, cfg.sigma_noise), 0.0, 0.0
-        return self.olfactionChemicalConc, self.olfactionWindDirection, self.olfactionWindSpeed
+            conc += np.random.normal(0, cfg.sigma_noise)
+            return conc, conc, 0.0, 0.0
+        raw = self.olfactionChemicalConc
+        return raw, self.rescale_concentration(raw), self.olfactionWindDirection, self.olfactionWindSpeed
 
     def run_step(self, pose):
         cfg = self.cfg
@@ -459,7 +479,8 @@ class TB4BaseController(Node):
         self.get_logger().info(f"===== Step {step_count + 1}/{cfg.step_threshold} at ({robot_x:.2f}, {robot_z:.2f}) =====")
 
         # --- 1. Olfaction: Bayesian update ---
-        current_odor_concentration, wind_direction, wind_speed = self.read_olfaction(robot_x, robot_z)
+        raw_concentration, current_odor_concentration, wind_direction, wind_speed = \
+            self.read_olfaction(robot_x, robot_z)
         self.bayesian_agent.posterior(current_odor_concentration, robot_x, robot_z)
         srcProbGivenOlfactory = self.bayesian_agent.prob_map
         olfactoryEntropy = map_entropy(srcProbGivenOlfactory)
@@ -521,7 +542,8 @@ class TB4BaseController(Node):
             "target_coord_estimation_error": target_error,
             "olfactory_max_x": float(olfactory_max_xz[0]),
             "olfactory_max_z": float(olfactory_max_xz[1]),
-            "concentration": current_odor_concentration,
+            "concentration": current_odor_concentration,         # rescaled, used by the Bayesian update
+            "raw_concentration": raw_concentration,
             "wind_direction": wind_direction,
             "wind_speed": wind_speed,
             "gt_distance_from_source": gt_distance,
@@ -533,7 +555,7 @@ class TB4BaseController(Node):
         pd.DataFrame(self.trajectory_log_list).to_csv(os.path.join(self.save_dir, "trajectory_log.csv"), index=False)
 
         self.get_logger().info(
-            f"conc={current_odor_concentration:.2f} H_C={olfactoryEntropy:.2f} (thr {self.entropy_threshold:.2f}) "
+            f"conc={current_odor_concentration:.2f} (raw {raw_concentration:.2f}) H_C={olfactoryEntropy:.2f} (thr {self.entropy_threshold:.2f}) "
             f"flag={behavior_flag} target={result['target_object']} @ {result['target_coordinate']} "
             f"olf_max=({olfactory_max_xz[0]:.2f}, {olfactory_max_xz[1]:.2f}) step_time={step_time:.2f}s")
 
