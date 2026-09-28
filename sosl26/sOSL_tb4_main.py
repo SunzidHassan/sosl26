@@ -6,7 +6,8 @@ Set the experiment parameters in main() below. Drive the robot with keyboard
 teleop (e.g. `ros2 run teleop_twist_keyboard teleop_twist_keyboard`); the
 controller only senses, fuses and logs. Stop with Ctrl+C or 'q' in the
 YOLO window: all results are written to
-    <sosl26>/save/save_{alg}_{odor}/{entropy_frac}/{run}/
+    <sosl26>/save/save_F_{Odor}_{vision_mode}/{entropy_frac}/{run}/   (fusion)
+    <sosl26>/save/save_O_{Odor}/{entropy_frac}/{run}/                 (olfactory-only)
 """
 
 import os
@@ -17,9 +18,8 @@ import cv2
 import numpy as np
 import rclpy
 from rclpy.executors import ExternalShutdownException
-from ultralytics import YOLO
 
-from sosl26.tb4_fusion_controller import ExperimentConfig, TB4FusionController
+from sosl26.tb4_base_controller import ExperimentConfig
 
 
 def default_save_root():
@@ -48,7 +48,8 @@ def next_run_dir(base_save_dir):
 
 def main(args=None):
     # ---------------- Experiment parameters ----------------
-    alg_choice = 'F'                 # 'F' fusion ('O' olfaction-only / 'V' vision-only goalSim)
+    alg_choice = 'F'                 # 'F' fusion (olfaction + vision) | 'O' olfactory-only
+    vision_mode = 'dirichlet'        # 'F' only: 'navKnowledge' (AI2-THOR object list) | 'dirichlet' (object map)
     odor = "burnt"
     entropy_frac = 0.8
     sample_period = 2.0              # n: seconds between olfactory + visual readings
@@ -70,12 +71,18 @@ def main(args=None):
     yolo_conf = 0.3
     yolo_exclude_classes = ["person"]
 
+    # Dirichlet object map (vision_mode 'dirichlet')
+    dirichlet_object_evidence = 1.0      # per detection, per footprint cell
+    dirichlet_background_evidence = 0.5  # per observed-empty cell (camera -> object)
+    dirichlet_max_radius = 1.0           # footprint radius clip (m); radius = half metric bbox width
+
     save_root = default_save_root()
     # --------------------------------------------------------
 
     cfg = ExperimentConfig(
         odor=odor,
         alg_choice=alg_choice,
+        vision_mode=vision_mode,
         entropy_frac=entropy_frac,
         sample_period=sample_period,
         step_threshold=step_threshold,
@@ -88,20 +95,30 @@ def main(args=None):
         source_position=source_position,
         yolo_conf=yolo_conf,
         yolo_exclude_classes=yolo_exclude_classes,
+        dirichlet_object_evidence=dirichlet_object_evidence,
+        dirichlet_background_evidence=dirichlet_background_evidence,
+        dirichlet_max_radius=dirichlet_max_radius,
     )
+    if alg_choice not in ('F', 'O'):
+        raise ValueError(f"alg_choice must be 'F' or 'O', got '{alg_choice}'")
 
     odor_tag = re.sub(r"[^A-Za-z0-9]+", "", odor.title())
-    base_save_dir = os.path.join(save_root, f"save_{alg_choice}_{odor_tag}", str(entropy_frac))
+    alg_folder = f"save_{alg_choice}_{odor_tag}" + (f"_{vision_mode}" if alg_choice == 'F' else "")
+    base_save_dir = os.path.join(save_root, alg_folder, str(entropy_frac))
     run_serial, save_dir = next_run_dir(base_save_dir)
     print(f"--- STARTING TB4 RUN {run_serial} --- Saving files to: {save_dir}")
 
     random.seed(run_serial)
     np.random.seed(run_serial)
 
-    yolo_model = YOLO(yolo_model_path)
-
     rclpy.init(args=args)
-    node = TB4FusionController(cfg, yolo_model, save_dir)
+    if alg_choice == 'F':
+        from ultralytics import YOLO
+        from sosl26.tb4_fusion_controller import TB4FusionController
+        node = TB4FusionController(cfg, YOLO(yolo_model_path), save_dir)
+    else:
+        from sosl26.tb4_olfactory_controller import TB4OlfactoryController
+        node = TB4OlfactoryController(cfg, save_dir)
     try:
         while rclpy.ok() and not node.done:
             rclpy.spin_once(node, timeout_sec=0.1)

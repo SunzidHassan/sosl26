@@ -1,0 +1,317 @@
+"""Dirichlet evidence accumulation object map (second vision approach).
+
+Per grid cell c, a Dirichlet over K = (object classes + Background) holds
+evidence beta[c]. The posterior class distribution is
+
+    p(o_k | z_c) = beta[c, k] / sum_j beta[c, j]
+
+Changes with respect to the confusion-matrix sample (psgsl_dirichlet_map.py):
+
+1. No confusion matrix: every detection adds `object_evidence` (1.0) to its
+   class in the cells of its footprint, and every observed-empty cell adds
+   `background_evidence` (0.5) to Background.
+2. Uniform prior: beta starts at prior_strength / K for every class
+   (objects and Background alike).
+3. Active background: for every detection, the cells between the camera and
+   the object (a corridor as wide as the object, inside the current field of
+   view and the map bounds, stopping at the object's footprint) are observed
+   free space -> Background evidence.
+4. Dynamic footprint: the footprint radius of each detection is half its
+   metric bounding box width (bbox width in px * depth / fx / 2), clipped to
+   [min_radius, max_radius], instead of a fixed FOOTPRINT_RADIUS.
+
+Each cell is updated at most once per class per frame, so overlapping
+detections / corridors in one frame don't double count.
+
+Source probability given vision:
+
+    sem[c]         = sum_k p(o_k | z_c) * max(0, sim(class_k, goal))
+    P(src | V)[c]  = sem[c] / sum_c sem[c]
+
+Background similarity is fixed to `background_similarity` (0 by default:
+empty space doesn't emit odor) instead of embedding the word "Background".
+
+Grid cells are centred on the same x_points / z_points as the Bayesian
+olfactory map (z = ROS map y, see sOSL_tb4Functions.py), so all maps align.
+"""
+
+import json
+import math
+import os
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+from scipy.special import digamma  # noqa: E402
+
+BACKGROUND = 'Background'
+
+
+class DirichletObjectMap:
+
+    def __init__(self, x_points, z_points, classes, background=BACKGROUND,
+                 object_evidence=1.0, background_evidence=0.5, prior_strength=1.0,
+                 min_radius=None, max_radius=1.0):
+        self.x_points = np.asarray(x_points, dtype=float)
+        self.z_points = np.asarray(z_points, dtype=float)
+        self.classes = [c for c in classes if c != background] + [background]
+        self.background = background
+        self.bg_idx = len(self.classes) - 1
+        self.cls_idx = {c: i for i, c in enumerate(self.classes)}
+        self.K = len(self.classes)
+        self.H, self.W = len(self.z_points), len(self.x_points)
+
+        self.res = float(self.x_points[1] - self.x_points[0]) if self.W > 1 else 0.25
+        self.object_evidence = object_evidence
+        self.background_evidence = background_evidence
+        self.min_radius = self.res / 2.0 if min_radius is None else min_radius
+        self.max_radius = max_radius
+
+        # (2) uniform prior over objects + background
+        self.prior_value = prior_strength / self.K
+        self.beta = np.full((self.H, self.W, self.K), self.prior_value)
+        self.observed = np.zeros((self.H, self.W), dtype=bool)
+
+        self.Xc, self.Zc = np.meshgrid(self.x_points, self.z_points)   # cell centres, (H, W)
+        self.class_weights = None
+        self.similarity_table = None
+
+    # ------------------------------------------------------------------
+    # Evidence accumulation
+    # ------------------------------------------------------------------
+
+    def _nearest_cell(self, x, z):
+        return int(np.abs(self.z_points - z).argmin()), int(np.abs(self.x_points - x).argmin())
+
+    def _in_bounds(self, x, z):
+        h = self.res / 2.0
+        return (self.x_points[0] - h <= x <= self.x_points[-1] + h
+                and self.z_points[0] - h <= z <= self.z_points[-1] + h)
+
+    def footprint_mask(self, x, z, radius):
+        """(4) Cells whose centre lies within `radius` of (x, z), at least the containing cell."""
+        mask = np.hypot(self.Xc - x, self.Zc - z) <= radius
+        if self._in_bounds(x, z):
+            mask[self._nearest_cell(x, z)] = True
+        return mask
+
+    def fov_mask(self, cam_xz, heading, hfov, max_range=None):
+        """Cells inside the camera's horizontal field of view (and range)."""
+        dx, dz = self.Xc - cam_xz[0], self.Zc - cam_xz[1]
+        bearing = np.arctan2(dz, dx) - heading
+        bearing = (bearing + np.pi) % (2.0 * np.pi) - np.pi
+        mask = np.abs(bearing) <= hfov / 2.0
+        if max_range is not None:
+            mask &= np.hypot(dx, dz) <= max_range
+        return mask
+
+    def corridor_mask(self, cam_xz, obj_xz, radius):
+        """(3) Cells between the camera and the object: within `radius` of the
+        camera -> object segment and before the object's footprint."""
+        cam = np.asarray(cam_xz, dtype=float)
+        vec = np.asarray(obj_xz, dtype=float) - cam
+        length = float(np.hypot(*vec))
+        if length < 1e-6:
+            return np.zeros((self.H, self.W), dtype=bool)
+        u = vec / length
+        dx, dz = self.Xc - cam[0], self.Zc - cam[1]
+        along = dx * u[0] + dz * u[1]
+        perp = np.abs(dx * u[1] - dz * u[0])
+        half_width = max(radius, self.res / 2.0)
+        return (along >= 0.0) & (along <= length - radius) & (perp <= half_width)
+
+    def update(self, detections, cam_xz, heading, hfov, max_range=None):
+        """Adds one frame of evidence.
+
+        Parameters
+        ----------
+        detections : list[dict]
+            From sOSL_tb4Functions.visionBranch (objectType, map_x, map_y, radius).
+        cam_xz : tuple
+            Camera position (map x, map y).
+        heading : float
+            Camera optical axis yaw in the map frame (rad, ROS convention).
+        hfov : float
+            Horizontal field of view (rad).
+
+        Returns
+        -------
+        dict
+            Number of object / background cells updated and skipped detections.
+        """
+        obj_masks = {}
+        footprint_union = np.zeros((self.H, self.W), dtype=bool)
+        corridors = np.zeros((self.H, self.W), dtype=bool)
+        skipped = []
+
+        for det in detections:
+            name = det['objectType']
+            if name not in self.cls_idx or name == self.background:
+                skipped.append(name)
+                continue
+            obj_xz = (det['map_x'], det['map_y'])
+            radius = float(np.clip(det.get('radius', self.min_radius), self.min_radius, self.max_radius))
+            fp = self.footprint_mask(obj_xz[0], obj_xz[1], radius)
+            k = self.cls_idx[name]
+            obj_masks[k] = obj_masks.get(k, np.zeros_like(fp)) | fp
+            footprint_union |= fp
+            corridors |= self.corridor_mask(cam_xz, obj_xz, radius)
+
+        background = corridors & self.fov_mask(cam_xz, heading, hfov, max_range) & ~footprint_union
+
+        for k, m in obj_masks.items():
+            self.beta[m, k] += self.object_evidence
+        self.beta[background, self.bg_idx] += self.background_evidence
+        self.observed |= footprint_union | background
+
+        return dict(object_cells=int(footprint_union.sum()), background_cells=int(background.sum()),
+                    skipped=skipped)
+
+    # ------------------------------------------------------------------
+    # Posterior / uncertainty
+    # ------------------------------------------------------------------
+
+    def posterior(self):
+        return self.beta / self.beta.sum(axis=2, keepdims=True)
+
+    def mle_class(self):
+        """argmax_k p(o_k | z_c); -1 for cells that never received evidence."""
+        mle = np.argmax(self.posterior(), axis=2)
+        mle[~self.observed] = -1
+        return mle
+
+    def shannon_entropy(self):
+        p = self.posterior()
+        return -np.sum(p * np.log(p + 1e-12), axis=2)
+
+    def expected_entropy(self):
+        """Expected Shannon entropy under the Dirichlet (Voxeland Eq. 7)."""
+        a0 = self.beta.sum(axis=2)
+        return digamma(a0 + 1.0) - np.sum(self.beta * digamma(self.beta + 1.0), axis=2) / a0
+
+    def observed_classes(self):
+        """Classes that received any evidence (Background included)."""
+        gained = (self.beta > self.prior_value + 1e-9).any(axis=(0, 1))
+        return [c for c, g in zip(self.classes, gained) if g]
+
+    # ------------------------------------------------------------------
+    # Semantic similarity -> P(source | vision)
+    # ------------------------------------------------------------------
+
+    def set_class_similarity(self, sentence_model, goal_phrase, background_similarity=0.0,
+                             clip_negative=True):
+        """Cosine similarity between goal_phrase and every class name (computed once)."""
+        names = self.classes[:-1]
+        goal = np.asarray(sentence_model.encode(goal_phrase, convert_to_tensor=False), dtype=float)
+        embs = np.asarray(sentence_model.encode(names, convert_to_tensor=False), dtype=float)
+        sims = embs @ goal / (np.linalg.norm(embs, axis=1) * np.linalg.norm(goal) + 1e-12)
+        raw = np.append(sims, background_similarity)
+        self.class_weights = np.clip(raw, 0.0, None) if clip_negative else raw
+        self.similarity_table = pd.DataFrame({
+            'class': self.classes, 'goal_phrase': goal_phrase,
+            'cosine_similarity': raw, 'weight': self.class_weights,
+        }).sort_values('cosine_similarity', ascending=False).reset_index(drop=True)
+        return self.similarity_table
+
+    def semantic_likelihood_map(self):
+        """sum_k p(o_k | z_c) * weight_k, shape (H, W)."""
+        return np.tensordot(self.posterior(), self.class_weights, axes=([2], [0]))
+
+    def source_prob_given_vision(self):
+        sem = self.semantic_likelihood_map()
+        total = sem.sum()
+        if total < 1e-12:
+            return np.full_like(sem, 1.0 / sem.size)
+        return sem / total
+
+    def top_object_at(self, row, col):
+        """Most probable non-background class at a cell (or 'N/A' if unobserved)."""
+        if not self.observed[row, col]:
+            return 'N/A'
+        p = self.posterior()[row, col, :-1]
+        return self.classes[int(np.argmax(p))]
+
+    # ------------------------------------------------------------------
+    # Saving
+    # ------------------------------------------------------------------
+
+    def _extent(self):
+        h = self.res / 2.0
+        return [self.x_points[0] - h, self.x_points[-1] + h, self.z_points[0] - h, self.z_points[-1] + h]
+
+    def plot_mle(self, save_path, title='MLE class  argmax p(o | z)', robot_xz=None):
+        """Class map of observed cells; grey = never observed."""
+        mle = self.mle_class()
+        present = sorted(set(mle[mle >= 0].tolist()))
+        fig, ax = plt.subplots(figsize=(7.5, 6))
+        ax.set_facecolor((0.85, 0.85, 0.85))
+        if present:
+            lut = {k: i for i, k in enumerate(present)}
+            img = np.full(mle.shape, np.nan)
+            for k, i in lut.items():
+                img[mle == k] = i
+            cmap = plt.get_cmap('tab20', max(len(present), 2))
+            im = ax.imshow(img, origin='lower', extent=self._extent(), cmap=cmap,
+                           vmin=-0.5, vmax=max(len(present), 2) - 0.5, aspect='equal')
+            cb = fig.colorbar(im, ax=ax, ticks=range(len(present)))
+            cb.ax.set_yticklabels([self.classes[k] for k in present])
+        if robot_xz is not None:
+            ax.plot(robot_xz[0], robot_xz[1], marker='o', ms=8, mfc='lime', mec='black', ls='')
+        ax.set_title(title)
+        ax.set_xlabel('map x (m)')
+        ax.set_ylabel('map y (m)')
+        fig.tight_layout()
+        fig.savefig(save_path, dpi=120)
+        plt.close(fig)
+
+    def save_final(self, out_dir):
+        """Per-class posteriors (observed classes), MLE, entropies, similarity table."""
+        maps_dir = os.path.join(out_dir, 'dirichlet_maps')
+        os.makedirs(maps_dir, exist_ok=True)
+        post = self.posterior()
+        np.savez_compressed(os.path.join(out_dir, 'dirichlet_final.npz'), beta=self.beta.astype(np.float32),
+                            posterior=post.astype(np.float32), observed=self.observed,
+                            x_points=self.x_points, z_points=self.z_points)
+        with open(os.path.join(out_dir, 'dirichlet_classes.json'), 'w') as f:
+            json.dump({'classes': self.classes, 'grid_HW': [self.H, self.W], 'res': self.res,
+                       'extent': self._extent(), 'object_evidence': self.object_evidence,
+                       'background_evidence': self.background_evidence,
+                       'prior_value': self.prior_value, 'radius_clip': [self.min_radius, self.max_radius]},
+                      f, indent=2)
+        if self.similarity_table is not None:
+            self.similarity_table.to_csv(os.path.join(out_dir, 'semantic_similarity_table.csv'), index=False)
+
+        extent = self._extent()
+        for cls in self.observed_classes():
+            k = self.cls_idx[cls]
+            fig, ax = plt.subplots(figsize=(7, 5.5))
+            im = ax.imshow(post[:, :, k], origin='lower', extent=extent, cmap='magma', vmin=0, vmax=1,
+                           aspect='equal')
+            ax.set_title(f'p(o = {cls} | z)')
+            fig.colorbar(im, ax=ax, label='probability')
+            fig.tight_layout()
+            fig.savefig(os.path.join(maps_dir, f"posterior__{cls.replace(' ', '_')}.png"), dpi=120)
+            plt.close(fig)
+
+        self.plot_mle(os.path.join(maps_dir, 'mle_class.png'))
+
+        for name, arr, lab in [('entropy_shannon', self.shannon_entropy(), 'H[p(o|z)] (nats)'),
+                               ('entropy_dirichlet', self.expected_entropy(), 'E[H] under Dirichlet (nats)'),
+                               ('semantic_likelihood', self.semantic_likelihood_map(),
+                                'sum_k p(o_k|z) * sim(class_k, goal)')]:
+            fig, ax = plt.subplots(figsize=(7, 5.5))
+            im = ax.imshow(arr, origin='lower', extent=extent, cmap='viridis', aspect='equal')
+            ax.set_title(lab)
+            fig.colorbar(im, ax=ax)
+            fig.tight_layout()
+            fig.savefig(os.path.join(maps_dir, f'{name}.png'), dpi=120)
+            plt.close(fig)
+
+
+def camera_pose_in_map(optical_to_map):
+    """Camera (x, y) and optical-axis yaw in the map frame from an optical->map transform."""
+    origin = np.asarray(optical_to_map(np.zeros(3)), dtype=float)
+    ahead = np.asarray(optical_to_map(np.array([0.0, 0.0, 1.0])), dtype=float)
+    return (origin[0], origin[1]), math.atan2(ahead[1] - origin[1], ahead[0] - origin[0])

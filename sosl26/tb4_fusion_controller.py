@@ -1,434 +1,115 @@
-"""ROS 2 (Jazzy) TurtleBot4 fusion controller for semantic odor source localization.
+"""Fusion ('F') TurtleBot4 controller: olfaction + vision.
 
-TB4 counterpart of ControlAlgorithms/Fusion/fusion_controller.py. Every
-`sample_period` seconds the node:
+TB4 counterpart of ControlAlgorithms/Fusion/fusion_controller.py. On top of
+the olfactory update in TB4BaseController, each step runs YOLO on the latest
+RGB + depth frame and fuses vision with olfaction using one of two vision
+approaches (ExperimentConfig.vision_mode):
 
-  1. reads the robot pose (TF map -> base_footprint),
-  2. takes the latest /olfaction reading and updates the Bayesian source map,
-  3. runs YOLO on the latest RGB + depth frame and updates envKnowledge,
-  4. fuses both into navKnowledge with add_goal_similarity,
-  5. saves the olfactory / visual / fused maps, frames, detections and the
-     trajectory log (same files as the AI2-THOR runs),
-  6. calls navigate(), which is currently a no-op (drive with teleop).
+'navKnowledge' (AI2-THOR approach, as is)
+    Detections are merged into an object list (envKnowledge);
+    add_goal_similarity scores each object with langSim * olfactionSim
+    (navKnowledge). Visual map = langSim heatmap, fused map = goalSim heatmap,
+    target = top navKnowledge object.
 
-See sOSL_tb4Functions.py for the ai2thor <-> ROS axis convention
-(robot_z / z_points == ROS map y).
+'dirichlet' (object distribution, sOSL_dirichletFunctions.py)
+    Detections add Dirichlet evidence to a per-cell class distribution
+    (objects +1, observed empty space between camera and objects -> Background
+    +0.5, footprint radius from the bounding box). Visual map
+    P(src | V) = normalised sum_k p(o_k | z) * sim(class_k, goal);
+    fused map = normalised P(src | C) * P(src | V); target = fused arg-max.
+
+Both modes use the same detections, and envKnowledge is kept in both so the
+detected-objects map is always available.
 """
 
-import json
 import math
 import os
-import time
-import traceback
-from dataclasses import asdict, dataclass, field
-from typing import Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 import pandas as pd
 
-import rclpy
-from rclpy.node import Node
-from rclpy.qos import (DurabilityPolicy, QoSProfile, ReliabilityPolicy,
-                       qos_profile_sensor_data)
-from geometry_msgs.msg import Twist, Vector3
-from nav_msgs.msg import OccupancyGrid
-from sensor_msgs.msg import CameraInfo, CompressedImage
-from tf2_ros import TransformException
-from tf2_ros.buffer import Buffer
-from tf2_ros.transform_listener import TransformListener
-
+from sOSL_dirichletFunctions import DirichletObjectMap, camera_pose_in_map
 from sOSL_loggerFunctions import map_entropy, plot_detected_objects
-from sOSL_olfactionFunctions import gaussian_plume
-from sOSL_tb4Functions import (
-    TB4BayesianAgent,
-    compute_maps,
-    decode_compressed_depth,
-    decode_compressed_rgb,
-    grid_from_bounds,
-    grid_from_occupancy,
-    intrinsics_from_fov,
-    optical_to_map_from_robot_pose,
-    plot_tb4_trajectory,
-    save_belief_maps,
-    scale_intrinsics,
-    transform_point,
-    ros_yaw_to_ai2thor_deg,
-    visionBranch,
-    yaw_from_quaternion,
-)
-from sOSL_utils import grid_to_world, parse_position_string, world_to_grid
-from sOSL_visionFunctions import add_goal_similarity
+from sOSL_tb4Functions import compute_maps, format_position, visionBranch
+from sOSL_utils import grid_to_world, parse_position_string
+from sosl26.tb4_base_controller import ExperimentConfig, TB4BaseController  # noqa: F401 (re-export)
+
+VISION_MODES = ('navKnowledge', 'dirichlet')
 
 
-# ==========================
-# Experiment Configuration
-# ==========================
+class TB4FusionController(TB4BaseController):
 
-@dataclass
-class ExperimentConfig:
-    """All experiment parameters. Filled in sOSL_tb4_main.main()."""
+    uses_camera = True
 
-    # --- Task ---
-    odor: str = "burnt"
-    goal_phrase: Optional[str] = None          # default: f"Is emitting {odor} odor:"
-    alg_choice: str = 'F'                      # 'F' fusion, 'O' olfaction-only, 'V' vision-only
-    entropy_frac: float = 0.8
+    def __init__(self, cfg, yolo_model, save_dir):
+        if cfg.vision_mode not in VISION_MODES:
+            raise ValueError(f"vision_mode must be one of {VISION_MODES}, got '{cfg.vision_mode}'")
+        # Imported here so olfactory-only runs don't load the sentence transformer.
+        import sOSL_visionFunctions
+        self._vision = sOSL_visionFunctions
 
-    # --- Sampling / run limits ---
-    sample_period: float = 2.0                 # seconds between olfactory + visual readings
-    step_threshold: int = 100
-    run_time_limit: Optional[float] = None     # seconds, None = until Ctrl+C / 'q'
-
-    # --- Olfaction (plume model) ---
-    q_s: float = 2000.0
-    D: float = 10.0
-    tau: float = 1000.0
-    U: float = 0.0
-    psi_deg: float = 0.0
-    sigma_noise: float = 1.5
-    use_simulated_olfaction: bool = False      # replace /olfaction by gaussian_plume(source_position)
-
-    # --- Map / grid ---
-    grid_step: float = 0.25
-    map_bounds: Optional[Tuple[float, float, float, float]] = None  # (x_min, x_max, y_min, y_max) map frame
-    map_wait_timeout: float = 10.0
-    fallback_map_size: float = 10.0            # square around the start pose if no /map and no bounds
-    source_position: Optional[Tuple[float, float]] = None           # ground truth (x, y) map frame, optional
-
-    # --- Vision ---
-    yolo_conf: float = 0.3
-    yolo_target_classes: Optional[Sequence[str]] = None             # None = all model classes
-    yolo_exclude_classes: Sequence[str] = field(default_factory=list)
-    depth_percentile: float = 50.0
-    depth_range: Tuple[float, float] = (0.2, 5.0)
-    merge_dist: float = 0.1
-    camera_hfov_deg: float = 69.0              # only used until CameraInfo arrives
-    camera_height: float = 0.25                # only used if the camera TF is unavailable
-
-    # --- ROS interfaces ---
-    rgb_topic: str = "/oakd/rgb/image_raw/compressed"
-    depth_topic: str = "/oakd/stereo/image_raw/compressedDepth"
-    camera_info_topic: str = "/oakd/rgb/camera_info"
-    olfaction_topic: str = "/olfaction"
-    map_topic: str = "/map"
-    cmd_vel_topic: str = "/cmd_vel"
-    map_frame: str = "map"
-    base_frame: str = "base_footprint"
-    camera_frame: str = ""                     # "" = use the RGB image header frame_id
-
-    show_window: bool = True
-
-    def resolved_goal_phrase(self):
-        return self.goal_phrase or f"Is emitting {self.odor} odor:"
-
-
-# ==========================
-# Controller Node
-# ==========================
-
-class TB4FusionController(Node):
-
-    def __init__(self, cfg: ExperimentConfig, yolo_model, save_dir: str):
-        super().__init__("sosl_tb4_fusion_controller")
-        self.cfg = cfg
         self.yolo_model = yolo_model
-        self.save_dir = save_dir
-        self.goal_phrase = cfg.resolved_goal_phrase()
-
-        # --- TF ---
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
-
-        # --- Subscriptions (sensor QoS matches both reliable and best-effort publishers) ---
-        self.create_subscription(CompressedImage, cfg.rgb_topic, self.image_callback, qos_profile_sensor_data)
-        self.create_subscription(CompressedImage, cfg.depth_topic, self.depth_callback, qos_profile_sensor_data)
-        self.create_subscription(CameraInfo, cfg.camera_info_topic, self.camera_info_callback, qos_profile_sensor_data)
-        self.create_subscription(Vector3, cfg.olfaction_topic, self.olfactory_callback, qos_profile_sensor_data)
-        map_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
-                             durability=DurabilityPolicy.TRANSIENT_LOCAL)
-        self.create_subscription(OccupancyGrid, cfg.map_topic, self.map_callback, map_qos)
-
-        # Reserved for navigate(). Nothing is published yet, so keyboard
-        # teleop on /cmd_vel is not overridden.
-        self.cmd_vel_pub = self.create_publisher(Twist, cfg.cmd_vel_topic, 10)
-
-        # --- Sensor state ---
-        self.latest_rgb = None
-        self.rgb_frame_id = ""
-        self.latest_depth = None
-        self.cam_K = None            # (fx, fy, cx, cy) from CameraInfo
-        self.cam_info_size = (0, 0)  # (width, height)
-        self.olfactionWindDirection = 0.0
-        self.olfactionWindSpeed = 0.0
-        self.olfactionChemicalConc = 0.0
-        self.olfaction_received = False
-        self.olfaction_raw = []
-        self.map_msg = None
-        self.latest_annotated = None
-
-        # --- Algorithm state ---
-        self.grid = None
-        self.bayesian_agent = None
-        self.H_max = None
-        self.entropy_threshold = None
-        self.start_pose = None
-        self.step_count = 0
         self.envKnowledge = pd.DataFrame()
         self.navKnowledge = pd.DataFrame()
-        self.trajectory_log_list = []
-
-        self.start_time = time.time()
-        self.done = False
-        self._finalized = False
-
-        self.step_timer = self.create_timer(cfg.sample_period, self.step_callback)
-        if cfg.show_window:
-            self.ui_timer = self.create_timer(0.05, self.ui_callback)
-
-        self.get_logger().info(
-            f"sOSL TB4 controller started. Goal: '{self.goal_phrase}', sample period {cfg.sample_period}s, "
-            f"plume q_s={cfg.q_s}, D={cfg.D}, tau={cfg.tau}. Saving to {save_dir}")
+        self.object_map = None
+        self.detection_log = []
+        self._frames = (None, None)
+        super().__init__(cfg, save_dir, node_name="sosl_tb4_fusion_controller")
 
     # ------------------------------------------------------------------
-    # Callbacks
+    # Setup
     # ------------------------------------------------------------------
 
-    def image_callback(self, msg: CompressedImage):
-        img = decode_compressed_rgb(msg.data)
-        if img is None:
-            self.get_logger().error("Failed to decode RGB image", throttle_duration_sec=5.0)
+    def dirichlet_classes(self):
+        """Object classes of the Dirichlet map: model classes after target / exclude filters."""
+        names = list(self.yolo_model.names.values())
+        if self.cfg.yolo_target_classes:
+            names = [n for n in names if n in self.cfg.yolo_target_classes]
+        return [n for n in names if n not in self.cfg.yolo_exclude_classes]
+
+    def setup_perception(self):
+        if self.cfg.vision_mode != 'dirichlet':
             return
-        self.latest_rgb = img
-        self.rgb_frame_id = msg.header.frame_id
-
-    def depth_callback(self, msg: CompressedImage):
-        depth = decode_compressed_depth(msg.data, msg.format)
-        if depth is None:
-            self.get_logger().error("Failed to decode depth image", throttle_duration_sec=5.0)
-            return
-        self.latest_depth = depth
-
-    def camera_info_callback(self, msg: CameraInfo):
-        k = msg.k
-        if k[0] > 0:
-            self.cam_K = (k[0], k[4], k[2], k[5])
-            self.cam_info_size = (msg.width, msg.height)
-
-    def olfactory_callback(self, msg: Vector3):
-        # x: wind direction, y: wind speed, z: chemical concentration
-        self.olfactionWindDirection = msg.x
-        self.olfactionWindSpeed = msg.y
-        self.olfactionChemicalConc = msg.z
-        self.olfaction_received = True
-
-        pose = self.get_robot_pose(warn=False)
-        self.olfaction_raw.append({
-            "time": round(time.time() - self.start_time, 3),
-            "robot_x": pose[0] if pose else np.nan,
-            "robot_z": pose[1] if pose else np.nan,
-            "robot_yaw": ros_yaw_to_ai2thor_deg(pose[2]) if pose else np.nan,
-            "robot_yaw_ros_deg": math.degrees(pose[2]) if pose else np.nan,
-            "wind_direction": msg.x,
-            "wind_speed": msg.y,
-            "chemicalConc": msg.z,
-        })
-
-    def map_callback(self, msg: OccupancyGrid):
-        self.map_msg = msg
-
-    def ui_callback(self):
-        frame = self.latest_annotated if self.latest_annotated is not None else self.latest_rgb
-        if frame is None:
-            return
-        try:
-            cv2.imshow("sOSL TB4 - YOLO", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                self.get_logger().info("'q' pressed. Ending run.")
-                self.done = True
-        except cv2.error as e:
-            self.get_logger().warn(f"Disabling OpenCV window: {e}")
-            self.ui_timer.cancel()
-
-    # ------------------------------------------------------------------
-    # Pose / camera helpers
-    # ------------------------------------------------------------------
-
-    def get_robot_pose(self, warn=True):
-        """Returns (x, y, yaw) of base_frame in map_frame, or None."""
-        try:
-            t = self.tf_buffer.lookup_transform(self.cfg.map_frame, self.cfg.base_frame, rclpy.time.Time())
-        except TransformException as ex:
-            if warn:
-                self.get_logger().warn(
-                    f"Could not get {self.cfg.map_frame}->{self.cfg.base_frame}: {ex}", throttle_duration_sec=2.0)
-            return None
-        q = t.transform.rotation
-        return (t.transform.translation.x, t.transform.translation.y,
-                yaw_from_quaternion(q.x, q.y, q.z, q.w))
-
-    def camera_intrinsics(self, rgb_shape):
-        h, w = rgb_shape[:2]
-        if self.cam_K is not None:
-            return scale_intrinsics(self.cam_K, self.cam_info_size, (w, h))
-        self.get_logger().warn("No CameraInfo yet, using HFOV intrinsics.", throttle_duration_sec=10.0)
-        return intrinsics_from_fov(w, h, self.cfg.camera_hfov_deg)
-
-    def optical_to_map_fn(self, pose):
-        """Returns a function mapping camera optical-frame points into the map frame."""
-        cam_frame = self.cfg.camera_frame or self.rgb_frame_id
-        if cam_frame:
-            try:
-                t = self.tf_buffer.lookup_transform(self.cfg.map_frame, cam_frame, rclpy.time.Time())
-                tr = (t.transform.translation.x, t.transform.translation.y, t.transform.translation.z)
-                q = (t.transform.rotation.x, t.transform.rotation.y, t.transform.rotation.z, t.transform.rotation.w)
-                return lambda p: transform_point(p, tr, q)
-            except TransformException as ex:
-                self.get_logger().warn(
-                    f"No TF {self.cfg.map_frame}->{cam_frame} ({ex}); using robot pose + camera_height.",
-                    throttle_duration_sec=10.0)
-        rx, ry, ryaw = pose
-        return lambda p: optical_to_map_from_robot_pose(p, rx, ry, ryaw, self.cfg.camera_height)
-
-    # ------------------------------------------------------------------
-    # Setup (grid + Bayesian agent) once pose and map are known
-    # ------------------------------------------------------------------
-
-    def setup_search(self, pose):
-        cfg = self.cfg
-        if cfg.map_bounds is not None:
-            x_min, x_max, y_min, y_max = cfg.map_bounds
-            self.grid = grid_from_bounds(x_min, x_max, y_min, y_max, cfg.grid_step)
-            grid_src = "map_bounds"
-        elif self.map_msg is not None:
-            info = self.map_msg.info
-            occ = np.array(self.map_msg.data, dtype=np.int8).reshape(info.height, info.width)
-            self.grid = grid_from_occupancy(occ, info.resolution, info.origin.position.x,
-                                            info.origin.position.y, cfg.grid_step)
-            grid_src = cfg.map_topic
-        elif time.time() - self.start_time > cfg.map_wait_timeout:
-            half = cfg.fallback_map_size / 2.0
-            self.get_logger().warn(
-                f"No {cfg.map_topic} received and no map_bounds set. Using a {cfg.fallback_map_size} m "
-                f"square around the start pose.")
-            self.grid = grid_from_bounds(pose[0] - half, pose[0] + half, pose[1] - half, pose[1] + half,
-                                         cfg.grid_step)
-            grid_src = "fallback"
-        else:
-            self.get_logger().info(f"Waiting for {cfg.map_topic}...", throttle_duration_sec=2.0)
-            return False
-
-        g = self.grid
-        self.start_pose = pose
-        start_grid_pos = world_to_grid(pose[0], pose[1], g.x_points, g.z_points)
-        src_grid_pos = (world_to_grid(cfg.source_position[0], cfg.source_position[1], g.x_points, g.z_points)
-                        if cfg.source_position is not None else None)
-
-        self.bayesian_agent = TB4BayesianAgent(
-            pos=start_grid_pos,
-            src_pos=src_grid_pos,
-            x_points=g.x_points,
-            z_points=g.z_points,
-            sigma_noise=cfg.sigma_noise,
-            reachable_positions=g.reachable_positions,
-            q_s=cfg.q_s, D=cfg.D, tau=cfg.tau, U=cfg.U, psi_deg=cfg.psi_deg,
+        cfg, g = self.cfg, self.grid
+        self.object_map = DirichletObjectMap(
+            g.x_points, g.z_points, self.dirichlet_classes(),
+            object_evidence=cfg.dirichlet_object_evidence,
+            background_evidence=cfg.dirichlet_background_evidence,
+            prior_strength=cfg.dirichlet_prior_strength,
+            min_radius=cfg.dirichlet_min_radius,
+            max_radius=cfg.dirichlet_max_radius,
         )
-        self.H_max = map_entropy(self.bayesian_agent.prob_map)
-        self.entropy_threshold = self.H_max * cfg.entropy_frac
-
+        table = self.object_map.set_class_similarity(
+            self._vision.model, self.goal_phrase,
+            background_similarity=cfg.dirichlet_background_similarity)
         self.get_logger().info(
-            f"Search grid from {grid_src}: x [{g.x_points[0]:.2f}, {g.x_points[-1]:.2f}], "
-            f"y [{g.z_points[0]:.2f}, {g.z_points[-1]:.2f}], {len(g.z_points)}x{len(g.x_points)} cells. "
-            f"Start pose ({pose[0]:.2f}, {pose[1]:.2f}). H_max {self.H_max:.2f} bits, "
-            f"threshold {self.entropy_threshold:.2f} bits ({cfg.entropy_frac * 100:.0f}%).")
+            f"Dirichlet object map: {self.object_map.K} classes (incl. Background). "
+            f"Top class similarities to '{self.goal_phrase}':\n{table.head(8).to_string(index=False)}")
 
-        run_info = {
-            "config": asdict(cfg),
-            "goal_phrase": self.goal_phrase,
-            "start_pose": {"x": pose[0], "y": pose[1], "yaw_ros_deg": math.degrees(pose[2]),
-                           "yaw_ai2thor_deg": ros_yaw_to_ai2thor_deg(pose[2])},
-            "grid_source": grid_src,
-            "grid_bounds": list(map(float, g.bounds)),
-            "x_points": g.x_points.tolist(),
-            "z_points(map_y)": g.z_points.tolist(),
-            "H_max": float(self.H_max),
-            "entropy_threshold": float(self.entropy_threshold),
-            "yolo_classes": dict(getattr(self.yolo_model, "names", {})),
-        }
-        with open(os.path.join(self.save_dir, "run_config.json"), "w") as f:
-            json.dump(run_info, f, indent=2, default=str)
-        return True
+    def run_info_extra(self):
+        info = {"yolo_classes": dict(getattr(self.yolo_model, "names", {}))}
+        if self.object_map is not None:
+            info["dirichlet_classes"] = self.object_map.classes
+        return info
 
     # ------------------------------------------------------------------
-    # Main loop (every sample_period seconds)
+    # Per-step perception
     # ------------------------------------------------------------------
 
-    def step_callback(self):
-        if self.done:
-            return
-        cfg = self.cfg
-
-        if cfg.run_time_limit is not None and time.time() - self.start_time > cfg.run_time_limit:
-            self.get_logger().info(f"Run time limit {cfg.run_time_limit}s reached. Ending run.")
-            self.done = True
-            return
-
-        pose = self.get_robot_pose()
-        if pose is None:
-            return
-
-        missing = [name for name, ok in (("RGB", self.latest_rgb is not None),
-                                         ("depth", self.latest_depth is not None),
-                                         ("olfaction", self.olfaction_received or cfg.use_simulated_olfaction))
-                   if not ok]
-        if missing:
-            self.get_logger().warn(f"Waiting for: {', '.join(missing)}", throttle_duration_sec=2.0)
-            return
-
-        if self.grid is None and not self.setup_search(pose):
-            return
-
-        try:
-            self.run_step(pose)
-        except Exception:
-            # Keep the run alive (and its data) if a single step fails
-            self.get_logger().error(f"Step {self.step_count} failed:\n{traceback.format_exc()}")
-
-        if self.step_count >= cfg.step_threshold:
-            self.get_logger().info(f"Step threshold {cfg.step_threshold} reached. Ending run.")
-            self.done = True
-
-    def run_step(self, pose):
-        cfg = self.cfg
-        g = self.grid
-        step_start_time = time.time()
-        step_count = self.step_count
-        robot_x, robot_z, robot_yaw = pose   # robot_z == map y (ai2thor naming); robot_yaw is ROS (rad, CCW from +x)
-
-        self.get_logger().info(f"===== Step {step_count + 1}/{cfg.step_threshold} at ({robot_x:.2f}, {robot_z:.2f}) =====")
-
+    def perceive(self, pose, step_count, srcProbGivenOlfactory):
+        cfg, g = self.cfg, self.grid
         rgb = self.latest_rgb.copy()
         depth = self.latest_depth.copy()
+        self._frames = (rgb, depth)
 
-        # --- 1. Olfaction: Bayesian update ---
-        if cfg.use_simulated_olfaction and cfg.source_position is not None:
-            current_odor_concentration = gaussian_plume(
-                robot_x, robot_z, tuple(cfg.source_position),
-                q_s=cfg.q_s, D=cfg.D, U=cfg.U, tau=cfg.tau, psi_deg=cfg.psi_deg,
-            ) + np.random.normal(0, cfg.sigma_noise)
-            wind_direction, wind_speed = 0.0, 0.0
-        else:
-            current_odor_concentration = self.olfactionChemicalConc
-            wind_direction, wind_speed = self.olfactionWindDirection, self.olfactionWindSpeed
+        K = self.camera_intrinsics(rgb.shape)
+        optical_to_map = self.optical_to_map_fn(pose)
 
-        self.bayesian_agent.posterior(current_odor_concentration, robot_x, robot_z)
-        srcProbGivenOlfactory = self.bayesian_agent.prob_map
-
-        # --- 2. Vision: detect + localize objects ---
-        self.envKnowledge, annotated = visionBranch(
+        self.envKnowledge, annotated, detections = visionBranch(
             self.yolo_model, self.envKnowledge, rgb, depth,
-            K=self.camera_intrinsics(rgb.shape),
-            optical_to_map=self.optical_to_map_fn(pose),
+            K=K,
+            optical_to_map=optical_to_map,
             save_dir=self.save_dir, step_count=step_count,
             confThr=cfg.yolo_conf,
             target_names=cfg.yolo_target_classes,
@@ -439,29 +120,24 @@ class TB4FusionController(Node):
             logger=self.get_logger().info,
         )
         self.latest_annotated = annotated
+        self.detection_log += [dict(step=step_count, **d) for d in detections]
 
-        # --- 3. Fusion: navKnowledge ---
-        self.navKnowledge = add_goal_similarity(self.envKnowledge.copy(), self.goal_phrase, srcProbGivenOlfactory,
-                                                g.x_points, g.z_points, alg_choice=cfg.alg_choice)
+        if cfg.vision_mode == 'navKnowledge':
+            return self._perceive_navknowledge(srcProbGivenOlfactory)
+
+        cam_xz, heading = camera_pose_in_map(optical_to_map)
+        hfov = 2.0 * math.atan(rgb.shape[1] / (2.0 * K[0]))
+        return self._perceive_dirichlet(srcProbGivenOlfactory, detections, cam_xz, heading, hfov)
+
+    def _perceive_navknowledge(self, srcProbGivenOlfactory):
+        g = self.grid
+        self.navKnowledge = self._vision.add_goal_similarity(
+            self.envKnowledge.copy(), self.goal_phrase, srcProbGivenOlfactory,
+            g.x_points, g.z_points, alg_choice='F')
         if not self.navKnowledge.empty:
             self.get_logger().info(f"NavKnowledge:\n{self.navKnowledge.head(4).to_string()}")
 
-        # --- 4. Maps + entropies ---
-        olf_map, vision_raw, goal_raw = compute_maps(srcProbGivenOlfactory, self.navKnowledge, g.x_points, g.z_points)
-        olfactoryEntropy = map_entropy(olf_map)
-        visionEntropy = map_entropy(vision_raw)
-        fused_entropy = map_entropy(goal_raw)
-
-        if step_count == 0:
-            behavior_flag = "Initialization"
-        elif olfactoryEntropy > self.entropy_threshold:
-            behavior_flag = "search"
-        else:
-            behavior_flag = "goal_navigation"
-
-        # --- 5. Targets + navigation (no-op for now) ---
-        max_idx = np.unravel_index(np.argmax(srcProbGivenOlfactory, axis=None), srcProbGivenOlfactory.shape)
-        olfactory_max_xz = grid_to_world(max_idx, g.x_points, g.z_points)
+        _, vision_raw, goal_raw = compute_maps(srcProbGivenOlfactory, self.navKnowledge, g.x_points, g.z_points)
 
         target_object, target_coordinate, target_xz = 'N/A', 'N/A', None
         if not self.navKnowledge.empty:
@@ -470,147 +146,68 @@ class TB4FusionController(Node):
             pred_pos = parse_position_string(target_coordinate)
             target_xz = np.array([pred_pos[0], pred_pos[2]])
 
-        self.navigate(behavior_flag, target_xz, olfactory_max_xz, pose)
+        return dict(
+            panels=[(vision_raw, 'V'), (goal_raw, 'F')],
+            arrays=dict(visual=vision_raw, fused=goal_raw),
+            target_object=target_object,
+            target_coordinate=target_coordinate,
+            target_xz=target_xz,
+            visual_entropy=map_entropy(vision_raw),
+            fused_entropy=map_entropy(goal_raw),
+        )
 
-        # --- 6. Evaluation against ground truth (if known) ---
-        gt_distance, target_error = np.nan, np.nan
-        if cfg.source_position is not None:
-            src = np.asarray(cfg.source_position, dtype=float)
-            gt_distance = float(np.linalg.norm(np.array([robot_x, robot_z]) - src))
-            if target_xz is not None:
-                target_error = float(np.linalg.norm(src - target_xz))
-
-        step_time = time.time() - step_start_time
-
-        # --- 7. Save everything ---
-        tag = f"{step_count:03d}_x_{robot_x:.2f}_z_{robot_z:.2f}"
-        self.save_step_outputs(step_count, tag, rgb, depth, olf_map, vision_raw, goal_raw, olfactoryEntropy)
-
-        self.trajectory_log_list.append({
-            "step": step_count,
-            "time": round(time.time() - self.start_time, 3),
-            "robot_x": robot_x,
-            "robot_z": robot_z,
-            "robot_yaw": ros_yaw_to_ai2thor_deg(robot_yaw),   # ai2thor convention (deg, CW from map +y)
-            "robot_yaw_ros_deg": math.degrees(robot_yaw),     # ROS convention (deg, CCW from map +x)
-            "step_time": step_time,
-            "behavior_flag": behavior_flag,
-            "is_random": False,
-            "target_object": target_object,
-            "target_coordinate": target_coordinate,
-            "target_coord_estimation_error": target_error,
-            "olfactory_max_x": float(olfactory_max_xz[0]),
-            "olfactory_max_z": float(olfactory_max_xz[1]),
-            "concentration": current_odor_concentration,
-            "wind_direction": wind_direction,
-            "wind_speed": wind_speed,
-            "gt_distance_from_source": gt_distance,
-            "Bayesian_entropy": olfactoryEntropy,
-            "visual_entropy": visionEntropy,
-            "fused_entropy": fused_entropy,
-            "entropy_threshold": self.entropy_threshold,
-        })
-        pd.DataFrame(self.trajectory_log_list).to_csv(os.path.join(self.save_dir, "trajectory_log.csv"), index=False)
-
+    def _perceive_dirichlet(self, srcProbGivenOlfactory, detections, cam_xz, heading, hfov):
+        g, om = self.grid, self.object_map
+        stats = om.update(detections, cam_xz, heading, hfov, max_range=self.cfg.depth_range[1])
         self.get_logger().info(
-            f"conc={current_odor_concentration:.2f} H_C={olfactoryEntropy:.2f} (thr {self.entropy_threshold:.2f}) "
-            f"flag={behavior_flag} target={target_object} olf_max=({olfactory_max_xz[0]:.2f}, {olfactory_max_xz[1]:.2f}) "
-            f"step_time={step_time:.2f}s")
+            f"Dirichlet update: {stats['object_cells']} object cells, {stats['background_cells']} background cells"
+            + (f", skipped {stats['skipped']}" if stats['skipped'] else ""))
 
-        self.step_count += 1
+        srcProbGivenVision = om.source_prob_given_vision()
+        fused = srcProbGivenOlfactory * srcProbGivenVision
+        total = fused.sum()
+        fused = fused / total if total > 1e-300 else np.full_like(fused, 1.0 / fused.size)
 
-    def save_step_outputs(self, step_count, tag, rgb, depth, olf_map, vision_raw, goal_raw, olfactoryEntropy):
+        row, col = np.unravel_index(np.argmax(fused), fused.shape)
+        x, z = grid_to_world((row, col), g.x_points, g.z_points)
+
+        return dict(
+            panels=[(srcProbGivenVision, 'V'), (fused, 'F')],
+            arrays=dict(visual=srcProbGivenVision, fused=fused, beta=om.beta.astype(np.float32),
+                        observed=om.observed, mle_class=om.mle_class()),
+            target_object=om.top_object_at(row, col),
+            target_coordinate=format_position(x, z, 0.0),
+            target_xz=np.array([x, z]),
+            visual_entropy=map_entropy(srcProbGivenVision),
+            fused_entropy=map_entropy(fused),
+        )
+
+    # ------------------------------------------------------------------
+    # Saving
+    # ------------------------------------------------------------------
+
+    def save_perception_outputs(self, step_count, tag):
         g = self.grid
-        try:
-            save_belief_maps(olf_map, vision_raw, goal_raw, g.x_points, g.z_points, olfactoryEntropy,
-                             os.path.join(self.save_dir, f"maps_all_{tag}.png"))
-        except Exception as e:
-            self.get_logger().error(f"Error saving belief map plot at step {step_count}: {e}")
+        rgb, depth = self._frames
+        cv2.imwrite(os.path.join(self.save_dir, f"frame_{tag}.png"), rgb)
+        cv2.imwrite(os.path.join(self.save_dir, f"depth_{step_count:03d}.png"),
+                    np.clip(depth * 1000.0, 0, 65535).astype(np.uint16))
 
-        # Raw arrays of the olfactory / visual / fused maps for later analysis
-        np.savez_compressed(os.path.join(self.save_dir, f"maps_{step_count:03d}.npz"),
-                            olfactory=olf_map, visual=vision_raw, fused=goal_raw,
-                            x_points=g.x_points, z_points=g.z_points)
+        plot_detected_objects(itemDF=self.envKnowledge, mask_closed=g.mask, scene_bounds_tuple=g.bounds,
+                              save_path=os.path.join(self.save_dir, f"detected_objects_map_{step_count:03d}.png"))
 
-        try:
-            cv2.imwrite(os.path.join(self.save_dir, f"frame_{tag}.png"), rgb)
-            cv2.imwrite(os.path.join(self.save_dir, f"depth_{step_count:03d}.png"),
-                        np.clip(depth * 1000.0, 0, 65535).astype(np.uint16))
-        except Exception as e:
-            self.get_logger().error(f"Error saving frames at step {step_count}: {e}")
-
-        try:
-            plot_detected_objects(itemDF=self.envKnowledge, mask_closed=g.mask, scene_bounds_tuple=g.bounds,
-                                  save_path=os.path.join(self.save_dir, f"detected_objects_map_{step_count:03d}.png"))
-        except Exception as e:
-            self.get_logger().error(f"Error saving detected objects map at step {step_count}: {e}")
-
-        try:
+        if self.cfg.vision_mode == 'navKnowledge':
             self.navKnowledge.to_csv(os.path.join(self.save_dir, f"navKnowledge_{tag}.csv"), index=False)
-        except Exception as e:
-            self.get_logger().error(f"Error saving navKnowledge CSV at step {step_count}: {e}")
+        else:
+            pose = self.get_robot_pose(warn=False)
+            self.object_map.plot_mle(os.path.join(self.save_dir, f"object_map_{step_count:03d}.png"),
+                                     title=f"Object map (MLE), step {step_count}",
+                                     robot_xz=pose[:2] if pose else None)
 
-    # ------------------------------------------------------------------
-    # Navigation
-    # ------------------------------------------------------------------
-
-    def navigate(self, behavior_flag, target_xz, olfactory_max_xz, pose):
-        """Moves the robot toward the current source estimate.
-
-        Not implemented yet: the robot is driven manually (keyboard teleop),
-        so this deliberately publishes nothing.
-
-        Parameters
-        ----------
-        behavior_flag : str
-            "Initialization", "search" or "goal_navigation" (fusion_controller semantics).
-        target_xz : np.ndarray | None
-            Map (x, y) of the top navKnowledge object (highest goalSim), or None.
-        olfactory_max_xz : np.ndarray
-            Map (x, y) of the most likely source cell of the Bayesian map.
-        pose : tuple
-            Current robot (x, y, yaw) in the map frame, yaw in the ROS
-            convention (rad, CCW from +x).
-
-        Note: fusion_controller computes headings as atan2(dx, dz) in Unity's
-        left-handed convention (CW from +z). Headings sent to the TB4 must use
-        the ROS convention instead: sOSL_tb4Functions.ros_heading_to().
-        """
-        # TODO: send a Nav2 goal / publish self.cmd_vel_pub toward target_xz
-        # (search: next waypoint toward the target, goal_navigation: go to it).
-        return None
-
-    # ------------------------------------------------------------------
-    # Shutdown
-    # ------------------------------------------------------------------
-
-    def finalize(self):
-        """Writes the end-of-run files. Safe to call more than once."""
-        if self._finalized:
-            return
-        self._finalized = True
-        print(f"Finalizing run after {self.step_count} steps. Saving to {self.save_dir}")
-
-        try:
-            if self.trajectory_log_list:
-                pd.DataFrame(self.trajectory_log_list).to_csv(os.path.join(self.save_dir, "trajectory_log.csv"),
-                                                              index=False)
-            self.envKnowledge.to_csv(os.path.join(self.save_dir, "envKnowledge_final.csv"), index=False)
+    def finalize_perception(self):
+        self.envKnowledge.to_csv(os.path.join(self.save_dir, "envKnowledge_final.csv"), index=False)
+        pd.DataFrame(self.detection_log).to_csv(os.path.join(self.save_dir, "detections_log.csv"), index=False)
+        if self.cfg.vision_mode == 'navKnowledge':
             self.navKnowledge.to_csv(os.path.join(self.save_dir, "navKnowledge_final.csv"), index=False)
-            pd.DataFrame(self.olfaction_raw).to_csv(os.path.join(self.save_dir, "olfaction_raw.csv"), index=False)
-        except Exception as e:
-            print(f"Error saving final CSVs: {e}")
-
-        if self.grid is not None and self.trajectory_log_list:
-            last = self.trajectory_log_list[-1]
-            estimate_xz = None
-            if last["target_coordinate"] not in ('N/A', None):
-                p = parse_position_string(last["target_coordinate"])
-                estimate_xz = (p[0], p[2])
-            plot_tb4_trajectory(
-                os.path.join(self.save_dir, "trajectory_log.csv"), self.grid,
-                os.path.join(self.save_dir, "trajectory_plot.png"),
-                source_xz=self.cfg.source_position, estimate_xz=estimate_xz,
-                plume_params=dict(q_s=self.cfg.q_s, D=self.cfg.D, U=self.cfg.U,
-                                  tau=self.cfg.tau, psi_deg=self.cfg.psi_deg),
-            )
+        elif self.object_map is not None:
+            self.object_map.save_final(self.save_dir)

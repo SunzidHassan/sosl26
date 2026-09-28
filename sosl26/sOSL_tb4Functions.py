@@ -242,12 +242,16 @@ def visionBranch(model, itemDF, rgb_bgr, depth_m, K, optical_to_map,
 
     Returns
     -------
-    tuple[pd.DataFrame, np.ndarray | None]
-        Updated itemDF and the annotated frame (BGR).
+    tuple[pd.DataFrame, np.ndarray | None, list[dict]]
+        Updated itemDF, the annotated frame (BGR), and this frame's
+        detections: dicts with objectType, Conf, map_x, map_y, map_z,
+        depth (m) and radius (m, half the metric bounding box width, used as
+        the Dirichlet footprint radius).
     """
     updated_itemDF = itemDF.copy()
+    detections = []
     if rgb_bgr is None:
-        return updated_itemDF, None
+        return updated_itemDF, None, detections
 
     target_classes = None
     if target_names:
@@ -282,7 +286,11 @@ def visionBranch(model, itemDF, rgb_bgr, depth_m, K, optical_to_map,
         # Stored in ai2thor order: x, up, z(=map y)
         new_position = np.array([map_x, map_z, map_y])
         position_str = format_position(map_x, map_y, map_z)
-        logger(f"Detected {className} ({confidence:.2f}) at depth {d:.2f} m -> map ({map_x:.2f}, {map_y:.2f})")
+        radius = (w_pix / 2.0) * d / K[0]
+        detections.append(dict(objectType=className, Conf=confidence, map_x=map_x, map_y=map_y,
+                               map_z=map_z, depth=d, radius=radius))
+        logger(f"Detected {className} ({confidence:.2f}) at depth {d:.2f} m, radius {radius:.2f} m "
+               f"-> map ({map_x:.2f}, {map_y:.2f})")
 
         cv2.putText(annotated_img, f"{d:.2f}m ({map_x:.2f}, {map_y:.2f})",
                     (max(0, x_pix - w_pix // 2), min(annotated_img.shape[0] - 5, y_pix + 15)),
@@ -321,7 +329,7 @@ def visionBranch(model, itemDF, rgb_bgr, depth_m, K, optical_to_map,
     if save_dir is not None:
         cv2.imwrite(os.path.join(save_dir, f"yolo_step{step_count}.jpg"), annotated_img)
 
-    return updated_itemDF, annotated_img
+    return updated_itemDF, annotated_img, detections
 
 
 # ==========================
@@ -456,31 +464,33 @@ def compute_maps(prob_map, navKnowledge, x_points, z_points):
     return prob_map.copy(), vision_raw, goal_raw
 
 
-def save_belief_maps(prob_map, vision_raw, goal_raw, x_points, z_points,
-                     olfactoryEntropy, out_fname):
-    """Saves the 3-panel (olfactory / visual / fused) figure.
+def _minmax(m):
+    m = np.asarray(m, dtype=float)
+    lo, hi = m.min(), m.max()
+    return (m - lo) / (hi - lo) if hi - lo > 1e-12 else np.zeros_like(m)
 
-    Same rendering as the belief map block in fusion_controller.py.
+
+def save_belief_maps(panels, x_points, z_points, out_fname):
+    """Saves a row of belief maps, e.g. olfactory / visual / fused.
+
+    Same rendering as the belief map block in fusion_controller.py (each map
+    min-max normalised, 'hot' colormap, colorbar on the last panel).
+
+    Parameters
+    ----------
+    panels : list[tuple[np.ndarray, str]]
+        (map, title) pairs; one panel for olfactory-only runs, three for fusion.
     """
-    map_max_olf = prob_map.max()
-    map_min_olf = prob_map.min()
-    inf_norm = (prob_map - map_min_olf) / (map_max_olf + 1e-9 - map_min_olf) if map_max_olf > 1e-9 else np.zeros_like(prob_map)
-    infomap_img = (np.clip(inf_norm, 0.0, 1.0) * 255).astype(np.uint8)
-    infomap_color = cv2.applyColorMap(infomap_img, cv2.COLORMAP_HOT)
-
-    vision_color = cv2.applyColorMap((vision_raw * 255).astype(np.uint8), cv2.COLORMAP_HOT)
-    goal_color = cv2.applyColorMap((goal_raw * 255).astype(np.uint8), cv2.COLORMAP_HOT)
-
-    maps = [cv2.cvtColor(m, cv2.COLOR_BGR2RGB) for m in (infomap_color, vision_color, goal_color)]
-    titles = [rf'$H_C={olfactoryEntropy:.2f}$', 'V', 'F']
-
-    fig, axes = plt.subplots(1, 3, figsize=(12, 5), sharex=True, sharey=True)
+    n = len(panels)
+    fig, axes = plt.subplots(1, n, figsize=(4 * n, 5), sharex=True, sharey=True, squeeze=False)
+    axes = axes[0]
     xmin, xmax = min(x_points), max(x_points)
     zmin, zmax = min(z_points), max(z_points)
     extent = [xmin, xmax, zmin, zmax]
 
-    for i, (ax, img, title) in enumerate(zip(axes, maps, titles)):
-        ax.imshow(img, origin='lower', extent=extent, aspect='equal')
+    for i, (ax, (raw, title)) in enumerate(zip(axes, panels)):
+        img = cv2.applyColorMap((np.clip(_minmax(raw), 0.0, 1.0) * 255).astype(np.uint8), cv2.COLORMAP_HOT)
+        ax.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), origin='lower', extent=extent, aspect='equal')
         ax.set_title(title, fontsize=TITLE_FONTSIZE)
         ax.grid(True, linestyle='--', linewidth=0.5, alpha=0.6)
         ax.set_xlim(xmin, xmax)
@@ -492,7 +502,7 @@ def save_belief_maps(prob_map, vision_raw, goal_raw, x_points, z_points,
         sm = cm.ScalarMappable(cmap='hot', norm=mcolors.Normalize(vmin=0.0, vmax=1.0))
         sm.set_array([])
         plt.colorbar(sm, cax=cax)
-        if i < 2:
+        if i < n - 1:
             cax.set_visible(False)
 
     plt.tight_layout()
