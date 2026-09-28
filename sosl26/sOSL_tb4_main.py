@@ -63,7 +63,7 @@ def resolve_concentration(value):
 
 def main(args=None):
     # ---------------- Experiment parameters ----------------
-    alg_choice = 'F'                 # 'F' fusion (olfaction + vision) | 'O' olfactory-only
+    alg_choice = 'O'                 # 'F' fusion (olfaction + vision) | 'O' olfactory-only
     vision_mode = 'dirichlet'        # 'F' only: 'navKnowledge' (AI2-THOR object list) | 'dirichlet' (object map)
     odor = "burnt"
     entropy_frac = 0.8
@@ -79,8 +79,8 @@ def main(args=None):
 
     # Rescaling of raw /olfaction readings: min -> 0, max -> 100 (same as the offline a * raw + b).
     # Each can be a number or the path of an olfaction_data.csv, whose mean chemicalConc is used.
-    olfaction_max_conc = 'testData/2026-09-15_sensorDump_high_2/olfaction_data.csv'
-    olfaction_min_conc = 480         # dummy min (measured: 'testData/2026-09-15_sensorDump_low/olfaction_data.csv')
+    olfaction_max_conc = 500
+    olfaction_min_conc = 350         # dummy min (measured: 'testData/2026-09-15_sensorDump_low/olfaction_data.csv')
 
     # Map / ground truth (ROS map frame)
     map_bounds = None                # (x_min, x_max, y_min, y_max); None = use /map
@@ -101,7 +101,7 @@ def main(args=None):
     # Dirichlet object map (vision_mode 'dirichlet')
     dirichlet_object_evidence = 1.0      # per detection, per footprint cell
     dirichlet_background_evidence = 0.5  # per observed-empty cell (camera -> object)
-    dirichlet_max_radius = 1.0           # footprint radius clip (m); radius = half metric bbox width
+    dirichlet_max_radius = 5.0           # footprint radius clip (m); radius = half metric bbox width
 
     save_root = default_save_root()
     # --------------------------------------------------------
