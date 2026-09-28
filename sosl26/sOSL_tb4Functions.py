@@ -20,6 +20,21 @@ as-is, ROS `map` frame coordinates are mapped as:
 
 So `robot_z`, `z_points` and the third entry of a "Position" string are all
 the ROS map *y* coordinate.
+
+Handedness: AI2-THOR/Unity is left-handed (x right, y up, z forward), ROS
+(REP 103) is right-handed (x forward, y left, z up). Swapping the y and z
+axes as above is exactly the right-to-left-handed conversion, so positions
+map 1:1 and a top-down plot (x right, z/map-y up, origin='lower') shows the
+same picture in both. Only *angles* differ:
+
+    ROS yaw      : counter-clockwise from +x      (atan2(dy, dx))
+    ai2thor yaw  : clockwise from +z (= map +y)   (atan2(dx, dz), rotation.y)
+    ai2thor_yaw_deg = (90 - ros_yaw_deg) mod 360
+
+Use the ROS convention for anything sent to the robot (Nav2 goals,
+cmd_vel); use ros_yaw_to_ai2thor_deg() only for logs compared against the
+AI2-THOR runs. The camera projection here uses the ROS optical frame + TF
+and does not reuse the Unity-camera math of coord23D_focal.
 """
 
 import math
@@ -54,6 +69,24 @@ LABEL_FONTSIZE = 32
 def yaw_from_quaternion(qx, qy, qz, qw):
     """Returns the yaw (rad) of a quaternion."""
     return math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+
+
+def ros_yaw_to_ai2thor_deg(yaw_rad):
+    """ROS yaw (rad, CCW from +x) -> ai2thor yaw (deg, CW from +z = map +y)."""
+    return (90.0 - math.degrees(yaw_rad)) % 360.0
+
+
+def ai2thor_deg_to_ros_yaw(yaw_deg):
+    """ai2thor yaw (deg, CW from +z = map +y) -> ROS yaw (rad, CCW from +x, in [-pi, pi))."""
+    return (math.radians(90.0 - yaw_deg) + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def ros_heading_to(robot_xy, target_xy):
+    """ROS yaw (rad) pointing from robot_xy to target_xy in the map frame.
+
+    ROS counterpart of fusion_controller's `atan2(delta_x, delta_z)`.
+    """
+    return math.atan2(target_xy[1] - robot_xy[1], target_xy[0] - robot_xy[0])
 
 
 def format_position(map_x, map_y, map_z):

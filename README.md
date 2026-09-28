@@ -44,3 +44,12 @@ depth (`/oakd/stereo/image_raw/compressedDepth`) messages. It then updates the B
 
 **Axis convention:** to reuse the AI2-THOR functions unchanged, ROS map `y` is stored as the AI2-THOR `z` axis.
 So `robot_z` is map y, and a `Position` string `"a, b, c"` means map (x=a, y=c, height=b).
+
+**Handedness:** AI2-THOR (Unity) is left-handed and ROS (REP 103) is right-handed. The y/z swap above is the
+conversion between the two, so positions and top-down plots match. Angles do not match:
+
+- ROS yaw is counter-clockwise from +x.
+- AI2-THOR yaw is clockwise from +z (map +y).
+
+`trajectory_log.csv` stores `robot_yaw` in the AI2-THOR convention (`(90 - ros_deg) mod 360`) and `robot_yaw_ros_deg`
+in the ROS convention. Headings sent to the robot must use `ros_heading_to()`, not the `atan2(dx, dz)` in `fusion_controller.py`.

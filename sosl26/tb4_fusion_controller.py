@@ -53,6 +53,7 @@ from sOSL_tb4Functions import (
     save_belief_maps,
     scale_intrinsics,
     transform_point,
+    ros_yaw_to_ai2thor_deg,
     visionBranch,
     yaw_from_quaternion,
 )
@@ -226,7 +227,8 @@ class TB4FusionController(Node):
             "time": round(time.time() - self.start_time, 3),
             "robot_x": pose[0] if pose else np.nan,
             "robot_z": pose[1] if pose else np.nan,
-            "robot_yaw": math.degrees(pose[2]) if pose else np.nan,
+            "robot_yaw": ros_yaw_to_ai2thor_deg(pose[2]) if pose else np.nan,
+            "robot_yaw_ros_deg": math.degrees(pose[2]) if pose else np.nan,
             "wind_direction": msg.x,
             "wind_speed": msg.y,
             "chemicalConc": msg.z,
@@ -343,7 +345,8 @@ class TB4FusionController(Node):
         run_info = {
             "config": asdict(cfg),
             "goal_phrase": self.goal_phrase,
-            "start_pose": {"x": pose[0], "y": pose[1], "yaw_deg": math.degrees(pose[2])},
+            "start_pose": {"x": pose[0], "y": pose[1], "yaw_ros_deg": math.degrees(pose[2]),
+                           "yaw_ai2thor_deg": ros_yaw_to_ai2thor_deg(pose[2])},
             "grid_source": grid_src,
             "grid_bounds": list(map(float, g.bounds)),
             "x_points": g.x_points.tolist(),
@@ -400,7 +403,7 @@ class TB4FusionController(Node):
         g = self.grid
         step_start_time = time.time()
         step_count = self.step_count
-        robot_x, robot_z, robot_yaw = pose   # robot_z == map y (ai2thor naming)
+        robot_x, robot_z, robot_yaw = pose   # robot_z == map y (ai2thor naming); robot_yaw is ROS (rad, CCW from +x)
 
         self.get_logger().info(f"===== Step {step_count + 1}/{cfg.step_threshold} at ({robot_x:.2f}, {robot_z:.2f}) =====")
 
@@ -488,7 +491,8 @@ class TB4FusionController(Node):
             "time": round(time.time() - self.start_time, 3),
             "robot_x": robot_x,
             "robot_z": robot_z,
-            "robot_yaw": math.degrees(robot_yaw),
+            "robot_yaw": ros_yaw_to_ai2thor_deg(robot_yaw),   # ai2thor convention (deg, CW from map +y)
+            "robot_yaw_ros_deg": math.degrees(robot_yaw),     # ROS convention (deg, CCW from map +x)
             "step_time": step_time,
             "behavior_flag": behavior_flag,
             "is_random": False,
@@ -565,7 +569,12 @@ class TB4FusionController(Node):
         olfactory_max_xz : np.ndarray
             Map (x, y) of the most likely source cell of the Bayesian map.
         pose : tuple
-            Current robot (x, y, yaw) in the map frame.
+            Current robot (x, y, yaw) in the map frame, yaw in the ROS
+            convention (rad, CCW from +x).
+
+        Note: fusion_controller computes headings as atan2(dx, dz) in Unity's
+        left-handed convention (CW from +z). Headings sent to the TB4 must use
+        the ROS convention instead: sOSL_tb4Functions.ros_heading_to().
         """
         # TODO: send a Nav2 goal / publish self.cmd_vel_pub toward target_xz
         # (search: next waypoint toward the target, goal_navigation: go to it).
