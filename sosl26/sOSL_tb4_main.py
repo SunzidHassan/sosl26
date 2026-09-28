@@ -60,7 +60,9 @@ def main(args=None):
     q_s = 12.8
     D = 0.01
     tau = 1000.0
-    sigma_noise = 60
+    sigma_noise = 60                 # std of the (baseline-corrected) sensor noise
+    olfaction_baseline = 'auto'      # None = raw readings | float = subtract it | 'auto' = median of first readings
+    olfaction_baseline_samples = 10  # readings used by 'auto' (start the robot away from the source)
 
     # Map / ground truth (ROS map frame)
     map_bounds = None                # (x_min, x_max, y_min, y_max); None = use /map
@@ -98,6 +100,8 @@ def main(args=None):
         D=D,
         tau=tau,
         sigma_noise=sigma_noise,
+        olfaction_baseline=olfaction_baseline,
+        olfaction_baseline_samples=olfaction_baseline_samples,
         map_bounds=map_bounds,
         source_position=source_position,
         yolo_conf=yolo_conf,
