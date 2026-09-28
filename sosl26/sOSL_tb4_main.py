@@ -52,23 +52,30 @@ def main(args=None):
     odor = "burnt"
     entropy_frac = 0.8
     sample_period = 2.0              # n: seconds between olfactory + visual readings
-    step_threshold = 100
+    step_threshold = 20
     run_time_limit = None            # seconds, None = until Ctrl+C / 'q'
 
     # Olfactory (Gaussian plume) parameters
-    q_s = 2000.0
-    D = 10.0
+    q_s = 12.8
+    D = 0.01
     tau = 1000.0
-    sigma_noise = 1.5
+    sigma_noise = 60
 
     # Map / ground truth (ROS map frame)
     map_bounds = None                # (x_min, x_max, y_min, y_max); None = use /map
     source_position = None           # ground-truth source (x, y) if known, for evaluation only
 
     # Vision
-    yolo_model_path = "yolo26m.pt"   # pretrained YOLO26m (downloaded by ultralytics if missing)
+    yolo_model_path = "yolo26m.pt"
     yolo_conf = 0.3
-    yolo_exclude_classes = ["person"]
+    yolo_exclude_classes = ["person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light",
+    "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
+    "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
+    "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle",
+    "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
+    "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch", "potted plant", "bed",
+    "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard", "cell phone", "oven",
+    "sink", "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush"]
 
     save_root = default_save_root()
     # --------------------------------------------------------
