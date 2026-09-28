@@ -164,7 +164,7 @@ def visionBranch(model, itemDF, controller, save_dir, step_count, fusionMode = N
 
     # Create list of IDs for everything else
     # target_classes = [idx for idx, name in model.names.items() if name not in exclude_names]
-    target_names = ['Apple', 'Book', 'Bottle', 'Bowl', 'Bread', 'ButterKnife', 'Cabinet', 'CoffeeMachine', 'CounterTop', 'CreditCard', 'Cup', 'DishSponge', 'Drawer', 'Egg', 'Faucet', 'Fork', 'Fridge', 'GarbageCan', 'HousePlant', 'Kettle', 'Knife', 'Lettuce', 'LightSwitch', 'Microwave', 'Mug', 'Pan', 'PaperTowelRoll', 'PepperShaker', 'Plate', 'Pot', 'Potato', 'SaltShaker', 'Shelf', 'ShelvingUnit', 'Sink', 'SoapBottle', 'Spatula', 'Spoon', 'Statue', 'Stool', 'StoveBurner', 'StoveKnob', 'Toaster', 'Tomato', 'Vase', 'WineBottle']
+    target_names = ['microwave', 'toaster', 'refrigerator']
     target_classes = [idx for idx, name in model.names.items() if name in target_names]
     # Run inference
     results = model(np.array(controller.last_event.frame), classes=target_classes)

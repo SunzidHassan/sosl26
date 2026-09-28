@@ -72,34 +72,6 @@ def gaussian_plume(x, z, source, q_s=2000, D=10, U=0, tau=1000, psi_deg=0):
     # return total + 1
     return total
 
-
-def simChemicalReading(source, robot_x, robot_z, sigma_noise=0.1):
-    """Simulates a noisy chemical sensor reading at the agent's current location.
-
-    Calculates the expected concentration using `gaussian_plume` at the agent's
-    position relative to the source and adds Gaussian noise.
-
-    Parameters
-    ----------
-    source : tuple[float, float]
-        The (x_s, z_s) coordinates of the odor source.
-    controller : ai2thor.controller.Controller
-        The AI2-THOR controller instance.
-    sigma_noise : float, optional
-        Standard deviation of the Gaussian noise added to the reading. Defaults to 0.5.
-
-    Returns
-    -------
-    float
-        The simulated noisy odor concentration reading.
-    """
-    # robot_x, robot_y, robot_z = np.array(list(controller.last_event.metadata["agent"]["position"].values()))
-    # Calculate true concentration at robot location
-    true_concentration = gaussian_plume(robot_x, robot_z, source)
-    # Add Gaussian noise (note: noise std dev is scaled by 4 here)
-    noisy_reading = true_concentration + np.random.normal(0, sigma_noise)
-    return noisy_reading
-
 # ==========================
 # Bayesian Functions
 # ==========================
