@@ -13,11 +13,13 @@ YOLO window: all results are written to
 import os
 import random
 import re
+import threading
+import time
 
 import cv2
 import numpy as np
 import rclpy
-from rclpy.executors import ExternalShutdownException
+from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 
 from sosl26.tb4_base_controller import ExperimentConfig
 
@@ -67,7 +69,8 @@ def main(args=None):
     vision_mode = 'dirichlet'        # 'F' only: 'navKnowledge' (AI2-THOR object list) | 'dirichlet' (object map)
     odor = "burnt"
     entropy_frac = 0.8
-    sample_period = 2.0              # n: seconds between olfactory + visual readings
+    sample_period = 5.0              # n: step window (s). Stop the robot; olfaction is averaged over it
+    vision_period = 0.5              # 'F': process a new camera frame at most every vision_period s
     step_threshold = 20
     run_time_limit = None            # seconds, None = until Ctrl+C / 'q'
 
@@ -112,6 +115,7 @@ def main(args=None):
         vision_mode=vision_mode,
         entropy_frac=entropy_frac,
         sample_period=sample_period,
+        vision_period=vision_period,
         step_threshold=step_threshold,
         run_time_limit=run_time_limit,
         q_s=q_s,
@@ -148,12 +152,26 @@ def main(args=None):
     else:
         from sosl26.tb4_olfactory_controller import TB4OlfactoryController
         node = TB4OlfactoryController(cfg, save_dir)
+    # Sensor callbacks and processing (steps / YOLO) run in parallel threads;
+    # the OpenCV window is driven from this (main) thread.
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
+    def spin():
+        try:
+            executor.spin()
+        except ExternalShutdownException:   # Ctrl+C shuts the context down
+            pass
+
+    spin_thread = threading.Thread(target=spin, daemon=True)
+    spin_thread.start()
     try:
-        while rclpy.ok() and not node.done:
-            rclpy.spin_once(node, timeout_sec=0.1)
+        while rclpy.ok() and not node.done and spin_thread.is_alive():
+            node.ui_update()
+            time.sleep(0.03)
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
+        executor.shutdown(timeout_sec=30.0)   # waits for a running step / frame to finish
         node.finalize()
         node.destroy_node()
         try:

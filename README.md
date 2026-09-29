@@ -43,11 +43,19 @@ ros2 run sosl26 sosl_tb4
 
 Stop with `Ctrl+C` (or `q` in the YOLO window). The run also ends at `step_threshold` or `run_time_limit`.
 
-Every `sample_period` seconds the node reads the pose (TF `map -> base_footprint`) and the latest `/olfaction`
-(`Vector3`: x = wind direction, y = wind speed, z = concentration), RGB (`/oakd/rgb/image_raw/compressed`) and
-depth (`/oakd/stereo/image_raw/compressedDepth`) messages. It then updates the Bayesian map, runs YOLO, and builds
-`navKnowledge` with `add_goal_similarity`. It calls `navigate()`, which does nothing yet, and it never publishes
-`/cmd_vel`, so teleop keeps control.
+Each step is a window of `sample_period` seconds (`n`, default 5 s). Stop the robot while it samples.
+
+- **Olfaction:** every `/olfaction` message in the window (`Vector3`: x = wind direction, y = wind speed, z = concentration)
+  is averaged. The Bayesian map is updated once per step with that mean, at the pose at the end of the window.
+- **Vision (`'F'`):** YOLO runs on every new frame, at most one per `vision_period` (default 0.5 s), throughout the window.
+  Each frame is projected with the pose at that moment. Its detections are merged into `envKnowledge`, and in Dirichlet
+  mode each frame adds its own evidence (+1 per detection footprint, +0.5 per background cell). A 5 s window therefore
+  adds up to about 10 evidence per object.
+- **End of the step:** maps are fused and saved, and `navigate()` is called. `navigate()` does nothing yet, and the node
+  never publishes `/cmd_vel`, so teleop keeps control.
+
+Sensor callbacks and processing run in separate threads (`MultiThreadedExecutor`), so `/olfaction` readings are not
+dropped while YOLO runs.
 
 ## Olfactory readings
 
@@ -58,7 +66,8 @@ Before the Bayesian update, raw `/olfaction` concentrations are rescaled linearl
 - Set `olfaction_min_conc` and `olfaction_max_conc` in `main()`. Each is a number or the path of an `olfaction_data.csv`, in which case its mean `chemicalConc` is used.
 - Values are not clipped, so readings below `min` become negative.
 - Leave both `None` to use raw readings.
-- `trajectory_log.csv` logs `raw_concentration` and the rescaled `concentration`.
+- `trajectory_log.csv` logs the window mean `raw_concentration`, its `raw_concentration_std`, the number of readings
+  (`olfaction_readings`), and the rescaled `concentration`. With `'F'` it also logs `vision_frames` and `vision_detections` per step.
 
 ## Outputs
 
@@ -66,7 +75,7 @@ Before the Bayesian update, raw `/olfaction` concentrations are rescaled linearl
 
 - `trajectory_log.csv`: one row per step, with the same columns as the AI2-THOR runs plus wind, the olfactory arg-max and time
 - `maps_all_XXX_x_.._z_...png`: the olfactory, visual (`langSim`) and fused (`goalSim`) maps, plus `maps_XXX.npz` with the raw arrays
-- `navKnowledge_XXX_*.csv`, `detected_objects_map_XXX.png`, `yolo_stepN.jpg`, `frame_*.png`, `depth_XXX.png` (mm)
+- `navKnowledge_XXX_*.csv`, `detected_objects_map_XXX.png`, `yolo_{step}_{frame}.jpg` (every processed frame; `save_vision_frames`), and `frame_*.png` / `depth_XXX.png` (mm) for the last frame of each step
 - `envKnowledge_final.csv`, `navKnowledge_final.csv`, `detections_log.csv` (every detection), `olfaction_raw.csv` (every `/olfaction` message), `trajectory_plot.png`, `run_config.json`
 - Dirichlet mode:
   - Each step: `object_map_XXX.png` (MLE class map; grey means never observed), plus `beta`, `observed` and `mle_class` in `maps_XXX.npz`.

@@ -1,9 +1,12 @@
 """Fusion ('F') TurtleBot4 controller: olfaction + vision.
 
 TB4 counterpart of ControlAlgorithms/Fusion/fusion_controller.py. On top of
-the olfactory update in TB4BaseController, each step runs YOLO on the latest
-RGB + depth frame and fuses vision with olfaction using one of two vision
-approaches (ExperimentConfig.vision_mode):
+the olfactory update in TB4BaseController, YOLO runs continuously during each
+step window: every new RGB + depth frame (at most one per `vision_period` s)
+is detected, projected with the robot pose at that moment and accumulated,
+so a step collects evidence from many frames instead of one. At the end of the
+step, vision is fused with olfaction using one of two vision approaches
+(ExperimentConfig.vision_mode):
 
 'navKnowledge' (AI2-THOR approach, as is)
     Detections are merged into an object list (envKnowledge);
@@ -12,7 +15,7 @@ approaches (ExperimentConfig.vision_mode):
     target = top navKnowledge object.
 
 'dirichlet' (object distribution, sOSL_dirichletFunctions.py)
-    Detections add Dirichlet evidence to a per-cell class distribution
+    Every processed frame adds Dirichlet evidence to a per-cell class distribution
     (objects +1, observed empty space between camera and objects -> Background
     +0.5, footprint radius from the bounding box). Visual map
     P(src | V) = normalised sum_k p(o_k | z) * sim(class_k, goal);
@@ -55,7 +58,13 @@ class TB4FusionController(TB4BaseController):
         self.object_map = None
         self.detection_log = []
         self._frames = (None, None)
+        self._last_seq = 0
+        self.frame_count = 0              # frames processed in the whole run
+        self.step_frames = 0              # frames processed in the current step window
+        self.step_detections = 0
         super().__init__(cfg, save_dir, node_name="sosl_tb4_fusion_controller")
+        self.vision_timer = self.create_timer(cfg.vision_period, self.vision_callback,
+                                              callback_group=self.processing_group)
 
     # ------------------------------------------------------------------
     # Setup
@@ -97,12 +106,26 @@ class TB4FusionController(TB4BaseController):
     # Per-step perception
     # ------------------------------------------------------------------
 
-    def perceive(self, pose, step_count, srcProbGivenOlfactory):
-        cfg, g = self.cfg, self.grid
+    def vision_callback(self):
+        """Processes the newest camera frame and accumulates its evidence (runs during the step window)."""
+        if self.done or self.grid is None or self.window_start is None:
+            return
+        if self.latest_rgb is None or self.latest_depth is None or self.rgb_seq == self._last_seq:
+            return
+        pose = self.get_robot_pose(warn=False)
+        if pose is None:
+            return
+        self._last_seq = self.rgb_seq
+        try:
+            self.process_frame(pose)
+        except Exception as e:
+            self.get_logger().error(f"Vision frame {self.frame_count} failed: {e}")
+
+    def process_frame(self, pose):
+        cfg = self.cfg
         rgb = self.latest_rgb.copy()
         depth = self.latest_depth.copy()
         self._frames = (rgb, depth)
-
         K = self.camera_intrinsics(rgb.shape)
         optical_to_map = self.optical_to_map_fn(pose)
 
@@ -110,24 +133,46 @@ class TB4FusionController(TB4BaseController):
             self.yolo_model, self.envKnowledge, rgb, depth,
             K=K,
             optical_to_map=optical_to_map,
-            save_dir=self.save_dir, step_count=step_count,
+            save_dir=None,
             confThr=cfg.yolo_conf,
             target_names=cfg.yolo_target_classes,
             exclude_names=cfg.yolo_exclude_classes,
             depth_percentile=cfg.depth_percentile,
             depth_range=cfg.depth_range,
             merge_dist=cfg.merge_dist,
-            logger=self.get_logger().info,
+            logger=self.get_logger().debug,
         )
         self.latest_annotated = annotated
-        self.detection_log += [dict(step=step_count, **d) for d in detections]
 
-        if cfg.vision_mode == 'navKnowledge':
-            return self._perceive_navknowledge(srcProbGivenOlfactory)
+        if self.object_map is not None:
+            cam_xz, heading = camera_pose_in_map(optical_to_map)
+            hfov = 2.0 * math.atan(rgb.shape[1] / (2.0 * K[0]))
+            self.object_map.update(detections, cam_xz, heading, hfov, max_range=cfg.depth_range[1])
 
-        cam_xz, heading = camera_pose_in_map(optical_to_map)
-        hfov = 2.0 * math.atan(rgb.shape[1] / (2.0 * K[0]))
-        return self._perceive_dirichlet(srcProbGivenOlfactory, detections, cam_xz, heading, hfov)
+        t = round(self.now(), 3)
+        self.detection_log += [dict(step=self.step_count, frame=self.frame_count, time=t,
+                                    robot_x=pose[0], robot_z=pose[1], **d) for d in detections]
+        if cfg.save_vision_frames:
+            cv2.imwrite(os.path.join(self.save_dir, f"yolo_{self.step_count:03d}_{self.frame_count:04d}.jpg"),
+                        annotated)
+        self.frame_count += 1
+        self.step_frames += 1
+        self.step_detections += len(detections)
+
+    def perceive(self, pose, step_count, srcProbGivenOlfactory):
+        frames, dets = self.step_frames, self.step_detections
+        self.step_frames = self.step_detections = 0
+        self.get_logger().info(f"Vision this step: {frames} frames, {dets} detections "
+                               f"({len(self.envKnowledge)} objects in envKnowledge)")
+        if frames == 0:
+            self.get_logger().warn("No camera frames were processed in this step window.")
+
+        if self.cfg.vision_mode == 'navKnowledge':
+            result = self._perceive_navknowledge(srcProbGivenOlfactory)
+        else:
+            result = self._perceive_dirichlet(srcProbGivenOlfactory)
+        result["log"] = dict(vision_frames=frames, vision_detections=dets)
+        return result
 
     def _perceive_navknowledge(self, srcProbGivenOlfactory):
         g = self.grid
@@ -156,13 +201,8 @@ class TB4FusionController(TB4BaseController):
             fused_entropy=map_entropy(goal_raw),
         )
 
-    def _perceive_dirichlet(self, srcProbGivenOlfactory, detections, cam_xz, heading, hfov):
+    def _perceive_dirichlet(self, srcProbGivenOlfactory):
         g, om = self.grid, self.object_map
-        stats = om.update(detections, cam_xz, heading, hfov, max_range=self.cfg.depth_range[1])
-        self.get_logger().info(
-            f"Dirichlet update: {stats['object_cells']} object cells, {stats['background_cells']} background cells"
-            + (f", skipped {stats['skipped']}" if stats['skipped'] else ""))
-
         srcProbGivenVision = om.source_prob_given_vision()
         fused = srcProbGivenOlfactory * srcProbGivenVision
         total = fused.sum()
@@ -188,10 +228,11 @@ class TB4FusionController(TB4BaseController):
 
     def save_perception_outputs(self, step_count, tag):
         g = self.grid
-        rgb, depth = self._frames
-        cv2.imwrite(os.path.join(self.save_dir, f"frame_{tag}.png"), rgb)
-        cv2.imwrite(os.path.join(self.save_dir, f"depth_{step_count:03d}.png"),
-                    np.clip(depth * 1000.0, 0, 65535).astype(np.uint16))
+        rgb, depth = self._frames   # last processed frame of the step
+        if rgb is not None:
+            cv2.imwrite(os.path.join(self.save_dir, f"frame_{tag}.png"), rgb)
+            cv2.imwrite(os.path.join(self.save_dir, f"depth_{step_count:03d}.png"),
+                        np.clip(depth * 1000.0, 0, 65535).astype(np.uint16))
 
         plot_detected_objects(itemDF=self.envKnowledge, mask_closed=g.mask, scene_bounds_tuple=g.bounds,
                               save_path=os.path.join(self.save_dir, f"detected_objects_map_{step_count:03d}.png"))
