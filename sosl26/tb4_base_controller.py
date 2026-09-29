@@ -1,11 +1,14 @@
 """Shared ROS 2 (Jazzy) TurtleBot4 controller for semantic odor source localization.
 
 TB4BaseController does everything that the olfactory-only ('O') and fusion
-('F') experiments have in common. Every `sample_period` seconds it:
+('F') experiments have in common. Each step lasts `sample_period` seconds
+(stop the robot while it samples). At the end of each step it:
 
   1. reads the robot pose (TF map -> base_footprint),
-  2. takes the latest /olfaction reading and updates the Bayesian source map,
-  3. calls `perceive()` (implemented by the subclass) for vision / fusion,
+  2. averages all /olfaction readings of the step window and updates the
+     Bayesian source map with that mean,
+  3. calls `perceive()` (implemented by the subclass) for vision / fusion; the
+     fusion controller processes camera frames continuously during the window,
   4. saves the maps and the trajectory log (same files as the AI2-THOR runs),
   5. calls navigate(), which is currently a no-op (drive with teleop).
 
@@ -30,6 +33,7 @@ import numpy as np
 import pandas as pd
 
 import rclpy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.node import Node
 from rclpy.qos import (DurabilityPolicy, QoSProfile, ReliabilityPolicy,
                        qos_profile_sensor_data)
@@ -76,7 +80,9 @@ class ExperimentConfig:
     entropy_frac: float = 0.8
 
     # --- Sampling / run limits ---
-    sample_period: float = 2.0                 # seconds between olfactory + visual readings
+    sample_period: float = 5.0                 # step window (s): olfaction is averaged over it, vision frames accumulate
+    vision_period: float = 0.5                 # 'F': process a new camera frame at most every vision_period s
+    save_vision_frames: bool = True            # 'F': save the annotated YOLO image of every processed frame
     step_threshold: int = 100
     run_time_limit: Optional[float] = None     # seconds, None = until Ctrl+C / 'q'
 
@@ -155,20 +161,29 @@ class TB4BaseController(Node):
         if cfg.olfaction_min_conc is not None and cfg.olfaction_max_conc == cfg.olfaction_min_conc:
             raise ValueError("olfaction_max_conc must differ from olfaction_min_conc.")
 
+        # Sensor callbacks run in their own group so they keep up while YOLO / the
+        # map updates (processing group) run; use a MultiThreadedExecutor (see main).
+        self.sensor_group = MutuallyExclusiveCallbackGroup()
+        self.processing_group = MutuallyExclusiveCallbackGroup()
+
         # --- TF ---
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # --- Subscriptions (sensor QoS matches both reliable and best-effort publishers) ---
         if self.uses_camera:
-            self.create_subscription(CompressedImage, cfg.rgb_topic, self.image_callback, qos_profile_sensor_data)
-            self.create_subscription(CompressedImage, cfg.depth_topic, self.depth_callback, qos_profile_sensor_data)
+            self.create_subscription(CompressedImage, cfg.rgb_topic, self.image_callback, qos_profile_sensor_data,
+                                     callback_group=self.sensor_group)
+            self.create_subscription(CompressedImage, cfg.depth_topic, self.depth_callback, qos_profile_sensor_data,
+                                     callback_group=self.sensor_group)
             self.create_subscription(CameraInfo, cfg.camera_info_topic, self.camera_info_callback,
-                                     qos_profile_sensor_data)
-        self.create_subscription(Vector3, cfg.olfaction_topic, self.olfactory_callback, qos_profile_sensor_data)
+                                     qos_profile_sensor_data, callback_group=self.sensor_group)
+        self.create_subscription(Vector3, cfg.olfaction_topic, self.olfactory_callback, qos_profile_sensor_data,
+                                 callback_group=self.sensor_group)
         map_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                              durability=DurabilityPolicy.TRANSIENT_LOCAL)
-        self.create_subscription(OccupancyGrid, cfg.map_topic, self.map_callback, map_qos)
+        self.create_subscription(OccupancyGrid, cfg.map_topic, self.map_callback, map_qos,
+                                 callback_group=self.sensor_group)
 
         # Reserved for navigate(). Nothing is published yet, so keyboard
         # teleop on /cmd_vel is not overridden.
@@ -176,6 +191,7 @@ class TB4BaseController(Node):
 
         # --- Sensor state ---
         self.latest_rgb = None
+        self.rgb_seq = 0             # incremented per decoded RGB frame
         self.rgb_frame_id = ""
         self.latest_depth = None
         self.cam_K = None            # (fx, fy, cx, cy) from CameraInfo
@@ -196,14 +212,16 @@ class TB4BaseController(Node):
         self.start_pose = None
         self.step_count = 0
         self.trajectory_log_list = []
+        self.window_start = None     # start of the current step window (s since start_time)
+        self.window_olf_idx = 0      # index of the window's first reading in olfaction_raw
 
         self.start_time = time.time()
         self.done = False
         self._finalized = False
 
-        self.step_timer = self.create_timer(cfg.sample_period, self.step_callback)
-        if cfg.show_window and self.uses_camera:
-            self.ui_timer = self.create_timer(0.05, self.ui_callback)
+        # Polls; a step runs once its window has lasted sample_period seconds.
+        self.step_timer = self.create_timer(0.1, self.step_callback, callback_group=self.processing_group)
+        self.show_window = cfg.show_window and self.uses_camera
 
         self.get_logger().info(
             f"sOSL TB4 {type(self).__name__} started (alg '{cfg.alg_choice}'). Goal: '{self.goal_phrase}', "
@@ -250,6 +268,7 @@ class TB4BaseController(Node):
             return
         self.latest_rgb = img
         self.rgb_frame_id = msg.header.frame_id
+        self.rgb_seq += 1
 
     def depth_callback(self, msg: CompressedImage):
         depth = decode_compressed_depth(msg.data, msg.format)
@@ -273,7 +292,7 @@ class TB4BaseController(Node):
 
         pose = self.get_robot_pose(warn=False)
         self.olfaction_raw.append({
-            "time": round(time.time() - self.start_time, 3),
+            "time": round(self.now(), 3),
             "robot_x": pose[0] if pose else np.nan,
             "robot_z": pose[1] if pose else np.nan,
             "robot_yaw": ros_yaw_to_ai2thor_deg(pose[2]) if pose else np.nan,
@@ -286,7 +305,10 @@ class TB4BaseController(Node):
     def map_callback(self, msg: OccupancyGrid):
         self.map_msg = msg
 
-    def ui_callback(self):
+    def ui_update(self):
+        """Shows the latest (annotated) frame; call from the main thread (OpenCV GUI is not thread-safe)."""
+        if not self.show_window:
+            return
         frame = self.latest_annotated if self.latest_annotated is not None else self.latest_rgb
         if frame is None:
             return
@@ -297,7 +319,10 @@ class TB4BaseController(Node):
                 self.done = True
         except cv2.error as e:
             self.get_logger().warn(f"Disabling OpenCV window: {e}")
-            self.ui_timer.cancel()
+            self.show_window = False
+
+    def now(self):
+        return time.time() - self.start_time
 
     # ------------------------------------------------------------------
     # Pose / camera helpers
@@ -355,7 +380,7 @@ class TB4BaseController(Node):
             self.grid = grid_from_occupancy(occ, info.resolution, info.origin.position.x,
                                             info.origin.position.y, cfg.grid_step)
             grid_src = cfg.map_topic
-        elif time.time() - self.start_time > cfg.map_wait_timeout:
+        elif self.now() > cfg.map_wait_timeout:
             half = cfg.fallback_map_size / 2.0
             self.get_logger().warn(
                 f"No {cfg.map_topic} received and no map_bounds set. Using a {cfg.fallback_map_size} m "
@@ -419,8 +444,10 @@ class TB4BaseController(Node):
         if self.done:
             return
         cfg = self.cfg
+        if self.window_start is not None and self.now() - self.window_start < cfg.sample_period:
+            return
 
-        if cfg.run_time_limit is not None and time.time() - self.start_time > cfg.run_time_limit:
+        if cfg.run_time_limit is not None and self.now() > cfg.run_time_limit:
             self.get_logger().info(f"Run time limit {cfg.run_time_limit}s reached. Ending run.")
             self.done = True
             return
@@ -437,7 +464,11 @@ class TB4BaseController(Node):
             self.get_logger().warn(f"Waiting for: {', '.join(missing)}", throttle_duration_sec=2.0)
             return
 
-        if self.grid is None and not self.setup_search(pose):
+        if self.grid is None:
+            if self.setup_search(pose):
+                # Step 0 starts now: it averages olfaction / accumulates vision over a full window.
+                self.start_window()
+                self.get_logger().info(f"Sampling step 1 for {cfg.sample_period:.1f}s...")
             return
 
         try:
@@ -445,10 +476,16 @@ class TB4BaseController(Node):
         except Exception:
             # Keep the run alive (and its data) if a single step fails
             self.get_logger().error(f"Step {self.step_count} failed:\n{traceback.format_exc()}")
+        self.start_window()
 
         if self.step_count >= cfg.step_threshold:
             self.get_logger().info(f"Step threshold {cfg.step_threshold} reached. Ending run.")
             self.done = True
+
+    def start_window(self):
+        """Starts the next step window: later /olfaction readings belong to the next step."""
+        self.window_start = self.now()
+        self.window_olf_idx = len(self.olfaction_raw)
 
     def rescale_concentration(self, raw):
         """Maps a raw reading linearly so olfaction_min_conc -> 0 and olfaction_max_conc -> olfaction_rescale_to."""
@@ -459,15 +496,31 @@ class TB4BaseController(Node):
         return a * (raw - cfg.olfaction_min_conc)
 
     def read_olfaction(self, robot_x, robot_z):
-        """(raw concentration, rescaled concentration, wind_direction, wind_speed)."""
+        """Mean olfaction over the current step window.
+
+        Returns dict: raw (mean raw concentration), concentration (rescaled mean),
+        raw_std, n_readings, wind_direction, wind_speed (means).
+        """
         cfg = self.cfg
         if cfg.use_simulated_olfaction and cfg.source_position is not None:
             conc = gaussian_plume(robot_x, robot_z, tuple(cfg.source_position),
                                   q_s=cfg.q_s, D=cfg.D, U=cfg.U, tau=cfg.tau, psi_deg=cfg.psi_deg)
             conc += np.random.normal(0, cfg.sigma_noise)
-            return conc, conc, 0.0, 0.0
-        raw = self.olfactionChemicalConc
-        return raw, self.rescale_concentration(raw), self.olfactionWindDirection, self.olfactionWindSpeed
+            return dict(raw=conc, concentration=conc, raw_std=0.0, n_readings=1,
+                        wind_direction=0.0, wind_speed=0.0)
+
+        window = self.olfaction_raw[self.window_olf_idx:]
+        if window:
+            conc = np.array([r["chemicalConc"] for r in window], dtype=float)
+            raw, raw_std = float(conc.mean()), float(conc.std())
+            wind_dir = float(np.mean([r["wind_direction"] for r in window]))
+            wind_speed = float(np.mean([r["wind_speed"] for r in window]))
+        else:
+            self.get_logger().warn("No /olfaction readings in this step window; using the latest reading.")
+            raw, raw_std = self.olfactionChemicalConc, 0.0
+            wind_dir, wind_speed = self.olfactionWindDirection, self.olfactionWindSpeed
+        return dict(raw=raw, concentration=self.rescale_concentration(raw), raw_std=raw_std,
+                    n_readings=len(window), wind_direction=wind_dir, wind_speed=wind_speed)
 
     def run_step(self, pose):
         cfg = self.cfg
@@ -479,8 +532,8 @@ class TB4BaseController(Node):
         self.get_logger().info(f"===== Step {step_count + 1}/{cfg.step_threshold} at ({robot_x:.2f}, {robot_z:.2f}) =====")
 
         # --- 1. Olfaction: Bayesian update ---
-        raw_concentration, current_odor_concentration, wind_direction, wind_speed = \
-            self.read_olfaction(robot_x, robot_z)
+        olf = self.read_olfaction(robot_x, robot_z)
+        current_odor_concentration, raw_concentration = olf["concentration"], olf["raw"]
         self.bayesian_agent.posterior(current_odor_concentration, robot_x, robot_z)
         srcProbGivenOlfactory = self.bayesian_agent.prob_map
         olfactoryEntropy = map_entropy(srcProbGivenOlfactory)
@@ -529,7 +582,7 @@ class TB4BaseController(Node):
 
         self.trajectory_log_list.append({
             "step": step_count,
-            "time": round(time.time() - self.start_time, 3),
+            "time": round(self.now(), 3),
             "robot_x": robot_x,
             "robot_z": robot_z,
             "robot_yaw": ros_yaw_to_ai2thor_deg(robot_yaw),   # ai2thor convention (deg, CW from map +y)
@@ -543,19 +596,23 @@ class TB4BaseController(Node):
             "olfactory_max_x": float(olfactory_max_xz[0]),
             "olfactory_max_z": float(olfactory_max_xz[1]),
             "concentration": current_odor_concentration,         # rescaled, used by the Bayesian update
-            "raw_concentration": raw_concentration,
-            "wind_direction": wind_direction,
-            "wind_speed": wind_speed,
+            "raw_concentration": raw_concentration,              # mean over the step window
+            "raw_concentration_std": olf["raw_std"],
+            "olfaction_readings": olf["n_readings"],
+            "window_start": round(self.window_start, 3),
+            "wind_direction": olf["wind_direction"],
+            "wind_speed": olf["wind_speed"],
             "gt_distance_from_source": gt_distance,
             "Bayesian_entropy": olfactoryEntropy,
             "visual_entropy": result["visual_entropy"],
             "fused_entropy": result["fused_entropy"],
             "entropy_threshold": self.entropy_threshold,
+            **result.get("log", {}),
         })
         pd.DataFrame(self.trajectory_log_list).to_csv(os.path.join(self.save_dir, "trajectory_log.csv"), index=False)
 
         self.get_logger().info(
-            f"conc={current_odor_concentration:.2f} (raw {raw_concentration:.2f}) H_C={olfactoryEntropy:.2f} (thr {self.entropy_threshold:.2f}) "
+            f"conc={current_odor_concentration:.2f} (raw mean {raw_concentration:.2f} of {olf['n_readings']}) H_C={olfactoryEntropy:.2f} (thr {self.entropy_threshold:.2f}) "
             f"flag={behavior_flag} target={result['target_object']} @ {result['target_coordinate']} "
             f"olf_max=({olfactory_max_xz[0]:.2f}, {olfactory_max_xz[1]:.2f}) step_time={step_time:.2f}s")
 
