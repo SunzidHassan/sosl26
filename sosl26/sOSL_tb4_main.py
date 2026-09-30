@@ -21,7 +21,8 @@ import numpy as np
 import rclpy
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 
-from sosl26.tb4_base_controller import ExperimentConfig
+from tb4_base_controller import ExperimentConfig
+# from sosl26.tb4_base_controller import ExperimentConfig
 
 
 def default_save_root():
@@ -75,8 +76,8 @@ def main(args=None):
     run_time_limit = None            # seconds, None = until Ctrl+C / 'q'
 
     # Olfactory (Gaussian plume) parameters
-    q_s = 12.8
-    D = 0.01
+    q_s = 8000
+    D = 10
     tau = 1000.0
     sigma_noise = 60                 # std of the sensor noise, in rescaled units
 
@@ -147,10 +148,12 @@ def main(args=None):
     rclpy.init(args=args)
     if alg_choice == 'F':
         from ultralytics import YOLO
-        from sosl26.tb4_fusion_controller import TB4FusionController
+        from tb4_fusion_controller import TB4FusionController
+        # from sosl26.tb4_fusion_controller import TB4FusionController
         node = TB4FusionController(cfg, YOLO(yolo_model_path), save_dir)
     else:
-        from sosl26.tb4_olfactory_controller import TB4OlfactoryController
+        from tb4_olfactory_controller import TB4OlfactoryController
+        # from sosl26.tb4_olfactory_controller import TB4OlfactoryController
         node = TB4OlfactoryController(cfg, save_dir)
     # Sensor callbacks and processing (steps / YOLO) run in parallel threads;
     # the OpenCV window is driven from this (main) thread.
