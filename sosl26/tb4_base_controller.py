@@ -26,7 +26,7 @@ import os
 import time
 import traceback
 from dataclasses import asdict, dataclass, field
-from typing import Optional, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -119,9 +119,13 @@ class ExperimentConfig:
     camera_height: float = 0.25                # only used if the camera TF is unavailable
 
     # --- Dirichlet object map (vision_mode 'dirichlet') ---
-    dirichlet_object_evidence: float = 1.0     # added to a class per detection footprint cell
-    dirichlet_background_evidence: float = 0.5 # added to Background per observed-empty cell
-    dirichlet_prior_strength: float = 1.0      # uniform prior: each class starts at prior_strength / K
+    dirichlet_conf_matrix: Optional[Sequence[Sequence[float]]] = None  # normalized, rows predicted / cols true
+    dirichlet_conf_labels: Optional[Sequence[str]] = None              # axis order, background last
+    dirichlet_bg_fp_rate: float = 0.05            # P(any false detection | background region)\
+    dirichlet_conf_temper: float = 1.0            # evidence weight = YOLO confidence * conf_temper
+    dirichlet_bg_false_neg_rate: Optional[float] = None  # eta; None = 1 - mean recall
+    dirichlet_bg_dist_decay: float = 0.5          # lambda: free-space evidence decay with distance
+    dirichlet_prior_strength: float = 1.0         # uniform prior: each class starts at prior_strength / K
     dirichlet_min_radius: Optional[float] = None  # footprint radius clip (m); None = grid_step / 2
     dirichlet_max_radius: float = 1.0
     dirichlet_background_similarity: float = 0.0  # sim(Background, goal) used in P(src | V)

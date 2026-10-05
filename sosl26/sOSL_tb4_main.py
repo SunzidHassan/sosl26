@@ -66,7 +66,7 @@ def resolve_concentration(value):
 
 def main(args=None):
     # ---------------- Experiment parameters ----------------
-    alg_choice = 'O'                 # 'F' fusion (olfaction + vision) | 'O' olfactory-only
+    alg_choice = 'F'                 # 'F' fusion (olfaction + vision) | 'O' olfactory-only
     vision_mode = 'dirichlet'        # 'F' only: 'navKnowledge' (AI2-THOR object list) | 'dirichlet' (object map)
     odor = "burnt"
     entropy_frac = 0.8
@@ -79,33 +79,47 @@ def main(args=None):
     q_s = 8000
     D = 10
     tau = 1000.0
-    sigma_noise = 60                 # std of the sensor noise, in rescaled units
+    sigma_noise = 200                 # std of the sensor noise, in rescaled units
 
     # Rescaling of raw /olfaction readings: min -> 0, max -> 100 (same as the offline a * raw + b).
     # Each can be a number or the path of an olfaction_data.csv, whose mean chemicalConc is used.
     olfaction_max_conc = 500
-    olfaction_min_conc = 350         # dummy min (measured: 'testData/2026-09-15_sensorDump_low/olfaction_data.csv')
+    olfaction_min_conc = 300         # dummy min (measured: 'testData/2026-09-15_sensorDump_low/olfaction_data.csv')
 
     # Map / ground truth (ROS map frame)
     map_bounds = None                # (x_min, x_max, y_min, y_max); None = use /map
     source_position = None           # ground-truth source (x, y) if known, for evaluation only
 
     # Vision
-    yolo_model_path = "yolo26m.pt"
+    yolo_model_path = "models/YOLO/neth234YOLO26m100epoch.pt"
     yolo_conf = 0.3
-    yolo_exclude_classes = ["person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light",
-    "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
-    "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
-    "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle",
-    "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
-    "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch", "potted plant", "bed",
-    "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard", "cell phone", "oven",
-    "sink", "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush"]
+    yolo_exclude_classes = []
+    # yolo_exclude_classes = ["person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light",
+    # "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
+    # "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
+    # "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle",
+    # "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
+    # "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch", "potted plant", "bed",
+    # "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard", "cell phone", "oven",
+    # "sink", "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush"]
 
     # Dirichlet object map (vision_mode 'dirichlet')
-    dirichlet_object_evidence = 1.0      # per detection, per footprint cell
-    dirichlet_background_evidence = 0.5  # per observed-empty cell (camera -> object)
-    dirichlet_max_radius = 5.0           # footprint radius clip (m); radius = half metric bbox width
+    # Dirichlet object map (vision_mode 'dirichlet'): YOLO validation metrics (Five_Objects.yolo26, 88 val images)
+    # Dirichlet object map: YOLO26m validation confusion matrix (normalized; rows predicted, columns true)
+    dirichlet_conf_labels = ['Cardboard box', 'Garbage can', 'Microwave', 'Refrigerator', 'Toaster', 'background']
+    dirichlet_conf_matrix = [
+        [0.91, 0.00, 0.00, 0.00, 0.00, 0.12],   # pred Cardboard box
+        [0.00, 1.00, 0.00, 0.00, 0.00, 0.10],   # pred Garbage can
+        [0.04, 0.00, 1.00, 0.05, 0.00, 0.41],   # pred Microwave
+        [0.00, 0.00, 0.00, 0.85, 0.04, 0.14],   # pred Refrigerator
+        [0.00, 0.00, 0.00, 0.00, 0.96, 0.23],   # pred Toaster
+        [0.04, 0.00, 0.00, 0.10, 0.00, 0.00],   # pred background (missed)
+    ]
+    dirichlet_bg_fp_rate = 0.05
+    dirichlet_conf_temper = 1.0
+    dirichlet_bg_false_neg_rate = None   # None -> 1 - mean recall (~0.05); try 0.15-0.2 for real range / occlusion
+    dirichlet_bg_dist_decay = 0.5
+    dirichlet_max_radius = 1.0
 
     save_root = default_save_root()
     # --------------------------------------------------------
@@ -129,8 +143,12 @@ def main(args=None):
         source_position=source_position,
         yolo_conf=yolo_conf,
         yolo_exclude_classes=yolo_exclude_classes,
-        dirichlet_object_evidence=dirichlet_object_evidence,
-        dirichlet_background_evidence=dirichlet_background_evidence,
+        dirichlet_conf_matrix=dirichlet_conf_matrix,
+        dirichlet_conf_labels=dirichlet_conf_labels,
+        dirichlet_bg_fp_rate=dirichlet_bg_fp_rate,
+        dirichlet_conf_temper=dirichlet_conf_temper,
+        dirichlet_bg_false_neg_rate=dirichlet_bg_false_neg_rate,
+        dirichlet_bg_dist_decay=dirichlet_bg_dist_decay,
         dirichlet_max_radius=dirichlet_max_radius,
     )
     if alg_choice not in ('F', 'O'):

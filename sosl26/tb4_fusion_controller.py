@@ -4,7 +4,7 @@ TB4 counterpart of ControlAlgorithms/Fusion/fusion_controller.py. On top of
 the olfactory update in TB4BaseController, YOLO runs continuously during each
 step window: every new RGB + depth frame (at most one per `vision_period` s)
 is detected, projected with the robot pose at that moment and accumulated,
-so a step collects evidence from many frames instead of one. At the end of the
+so a step collects evidence fromfrom sOSL_dirichletFunctions import DirichletObjectMap, camera_pose_in_map, confusion_matrix_from_normalized many frames instead of one. At the end of the
 step, vision is fused with olfaction using one of two vision approaches
 (ExperimentConfig.vision_mode):
 
@@ -15,11 +15,10 @@ step, vision is fused with olfaction using one of two vision approaches
     target = top navKnowledge object.
 
 'dirichlet' (object distribution, sOSL_dirichletFunctions.py)
-    Every processed frame adds Dirichlet evidence to a per-cell class distribution
-    (objects +1, observed empty space between camera and objects -> Background
-    +0.5, footprint radius from the bounding box). Visual map
-    P(src | V) = normalised sum_k p(o_k | z) * sim(class_k, goal);
-    fused map = normalised P(src | C) * P(src | V); target = fused arg-max.
+    Every processed frame adds Dirichlet evidence to a per-cell class distribution:
+    each detection adds confidence * (confusion-matrix row of its class) over a
+    footprint set by the bounding box (same-class overlaps are max-merged), and
+    every visible cell without a detection adds distance-decayed Background evidence.
 
 Both modes use the same detections, and envKnowledge is kept in both so the
 detected-objects map is always available.
@@ -32,7 +31,7 @@ import cv2
 import numpy as np
 import pandas as pd
 
-from sOSL_dirichletFunctions import DirichletObjectMap, camera_pose_in_map
+from sOSL_dirichletFunctions import DirichletObjectMap, camera_pose_in_map, confusion_matrix_from_normalized
 from sOSL_loggerFunctions import map_entropy, plot_detected_objects
 from sOSL_tb4Functions import compute_maps, format_position, visionBranch
 from sOSL_utils import grid_to_world, parse_position_string
@@ -63,6 +62,8 @@ class TB4FusionController(TB4BaseController):
         self.step_frames = 0              # frames processed in the current step window
         self.step_detections = 0
         super().__init__(cfg, save_dir, node_name="sosl_tb4_fusion_controller")
+        if cfg.vision_mode == 'dirichlet':
+            self.confusion_matrix, self.dirichlet_eta = self.build_confusion_matrix()
         self.vision_timer = self.create_timer(cfg.vision_period, self.vision_callback,
                                               callback_group=self.processing_group)
 
@@ -77,14 +78,27 @@ class TB4FusionController(TB4BaseController):
             names = [n for n in names if n in self.cfg.yolo_target_classes]
         return [n for n in names if n not in self.cfg.yolo_exclude_classes]
 
+    def build_confusion_matrix(self):
+        cfg = self.cfg
+        if cfg.dirichlet_conf_matrix is None or cfg.dirichlet_conf_labels is None:
+            raise ValueError("vision_mode 'dirichlet' needs dirichlet_conf_matrix and dirichlet_conf_labels.")
+        C = confusion_matrix_from_normalized(self.dirichlet_classes(), cfg.dirichlet_conf_matrix,
+                                             cfg.dirichlet_conf_labels, bg_fp_rate=cfg.dirichlet_bg_fp_rate)
+        eta = cfg.dirichlet_bg_false_neg_rate
+        if eta is None:
+            eta = float(C[-1, :-1].mean())      # mean miss rate from the matrix (~0.03)
+        return C, eta
+
     def setup_perception(self):
         if self.cfg.vision_mode != 'dirichlet':
             return
         cfg, g = self.cfg, self.grid
         self.object_map = DirichletObjectMap(
             g.x_points, g.z_points, self.dirichlet_classes(),
-            object_evidence=cfg.dirichlet_object_evidence,
-            background_evidence=cfg.dirichlet_background_evidence,
+            confusion_matrix=self.confusion_matrix,
+            conf_temper=cfg.dirichlet_conf_temper,
+            bg_false_neg_rate=self.dirichlet_eta,
+            bg_dist_decay=cfg.dirichlet_bg_dist_decay,
             prior_strength=cfg.dirichlet_prior_strength,
             min_radius=cfg.dirichlet_min_radius,
             max_radius=cfg.dirichlet_max_radius,
@@ -93,13 +107,16 @@ class TB4FusionController(TB4BaseController):
             self._vision.model, self.goal_phrase,
             background_similarity=cfg.dirichlet_background_similarity)
         self.get_logger().info(
-            f"Dirichlet object map: {self.object_map.K} classes (incl. Background). "
-            f"Top class similarities to '{self.goal_phrase}':\n{table.head(8).to_string(index=False)}")
+            f"Dirichlet object map: {self.object_map.K} classes (incl. Background), "
+            f"eta={self.dirichlet_eta:.3f}. Top class similarities to '{self.goal_phrase}':\n"
+            f"{table.head(8).to_string(index=False)}")
 
     def run_info_extra(self):
         info = {"yolo_classes": dict(getattr(self.yolo_model, "names", {}))}
         if self.object_map is not None:
             info["dirichlet_classes"] = self.object_map.classes
+            info["dirichlet_confusion_matrix"] = self.object_map.confusion_matrix.tolist()
+            info["dirichlet_bg_false_neg_rate"] = self.dirichlet_eta
         return info
 
     # ------------------------------------------------------------------
