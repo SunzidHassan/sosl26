@@ -119,7 +119,20 @@ def main(args=None):
     dirichlet_conf_temper = 1.0
     dirichlet_bg_false_neg_rate = None   # None -> 1 - mean recall (~0.05); try 0.15-0.2 for real range / occlusion
     dirichlet_bg_dist_decay = 0.5
-    dirichlet_max_radius = 1.0
+    dirichlet_max_radius = 3.0
+
+    # Ground-truth objects (map frame x, y) and plot colors
+    object_positions = {
+        'Garbage can':   (-1.5, -0.25),
+        'Toaster':       (-4.25, -0.4),
+        'Microwave':     (-6.4, -0.5),
+        'Refrigerator':  (-7.3, -3.1),
+        'Cardboard box': (-4.3, -5.2),
+    }
+    object_colors = {
+        'Garbage can': 'green', 'Toaster': 'red', 'Microwave': 'black',
+        'Refrigerator': 'blue', 'Cardboard box': 'saddlebrown', 'Background': 'cyan',
+    }
 
     save_root = default_save_root()
     # --------------------------------------------------------
@@ -150,6 +163,8 @@ def main(args=None):
         dirichlet_bg_false_neg_rate=dirichlet_bg_false_neg_rate,
         dirichlet_bg_dist_decay=dirichlet_bg_dist_decay,
         dirichlet_max_radius=dirichlet_max_radius,
+        object_positions=object_positions,
+        object_colors=object_colors,
     )
     if alg_choice not in ('F', 'O'):
         raise ValueError(f"alg_choice must be 'F' or 'O', got '{alg_choice}'")

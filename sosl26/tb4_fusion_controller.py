@@ -102,6 +102,8 @@ class TB4FusionController(TB4BaseController):
             prior_strength=cfg.dirichlet_prior_strength,
             min_radius=cfg.dirichlet_min_radius,
             max_radius=cfg.dirichlet_max_radius,
+            class_colors=cfg.object_colors,
+            gt_positions=cfg.object_positions,
         )
         table = self.object_map.set_class_similarity(
             self._vision.model, self.goal_phrase,
@@ -170,7 +172,7 @@ class TB4FusionController(TB4BaseController):
         self.detection_log += [dict(step=self.step_count, frame=self.frame_count, time=t,
                                     robot_x=pose[0], robot_z=pose[1], **d) for d in detections]
         if cfg.save_vision_frames:
-            cv2.imwrite(os.path.join(self.save_dir, f"yolo_{self.step_count:03d}_{self.frame_count:04d}.jpg"),
+            cv2.imwrite(self.out_path("yolo_detections", f"yolo_{self.step_count:03d}_{self.frame_count:04d}.jpg"),
                         annotated)
         self.frame_count += 1
         self.step_frames += 1
@@ -208,14 +210,15 @@ class TB4FusionController(TB4BaseController):
             pred_pos = parse_position_string(target_coordinate)
             target_xz = np.array([pred_pos[0], pred_pos[2]])
 
+        hv, hf = map_entropy(vision_raw), map_entropy(goal_raw)
         return dict(
-            panels=[(vision_raw, 'V'), (goal_raw, 'F')],
+            panels=[(vision_raw, rf'$H_V={hv:.2f}$'), (goal_raw, rf'$H_F={hf:.2f}$')],
             arrays=dict(visual=vision_raw, fused=goal_raw),
             target_object=target_object,
             target_coordinate=target_coordinate,
             target_xz=target_xz,
-            visual_entropy=map_entropy(vision_raw),
-            fused_entropy=map_entropy(goal_raw),
+            visual_entropy=hv,
+            fused_entropy=hf,
         )
 
     def _perceive_dirichlet(self, srcProbGivenOlfactory):
@@ -228,15 +231,16 @@ class TB4FusionController(TB4BaseController):
         row, col = np.unravel_index(np.argmax(fused), fused.shape)
         x, z = grid_to_world((row, col), g.x_points, g.z_points)
 
+        hv, hf = map_entropy(srcProbGivenVision), map_entropy(fused)
         return dict(
-            panels=[(srcProbGivenVision, 'V'), (fused, 'F')],
+            panels=[(srcProbGivenVision, rf'$H_V={hv:.2f}$'), (fused, rf'$H_F={hf:.2f}$')],
             arrays=dict(visual=srcProbGivenVision, fused=fused, beta=om.beta.astype(np.float32),
                         observed=om.observed, mle_class=om.mle_class()),
             target_object=om.top_object_at(row, col),
             target_coordinate=format_position(x, z, 0.0),
             target_xz=np.array([x, z]),
-            visual_entropy=map_entropy(srcProbGivenVision),
-            fused_entropy=map_entropy(fused),
+            visual_entropy=hv,
+            fused_entropy=hf,
         )
 
     # ------------------------------------------------------------------
@@ -244,21 +248,23 @@ class TB4FusionController(TB4BaseController):
     # ------------------------------------------------------------------
 
     def save_perception_outputs(self, step_count, tag):
-        g = self.grid
+        g, cfg = self.grid, self.cfg
         rgb, depth = self._frames   # last processed frame of the step
         if rgb is not None:
-            cv2.imwrite(os.path.join(self.save_dir, f"frame_{tag}.png"), rgb)
-            cv2.imwrite(os.path.join(self.save_dir, f"depth_{step_count:03d}.png"),
+            cv2.imwrite(self.out_path("frames", f"frame_{tag}.png"), rgb)
+            cv2.imwrite(self.out_path("depth", f"depth_{step_count:03d}.png"),
                         np.clip(depth * 1000.0, 0, 65535).astype(np.uint16))
 
         plot_detected_objects(itemDF=self.envKnowledge, mask_closed=g.mask, scene_bounds_tuple=g.bounds,
-                              save_path=os.path.join(self.save_dir, f"detected_objects_map_{step_count:03d}.png"))
+                              save_path=self.out_path("detected_objects_map",
+                                                      f"detected_objects_map_{step_count:03d}.png"),
+                              gt_objects=cfg.object_positions, class_colors=cfg.object_colors)
 
-        if self.cfg.vision_mode == 'navKnowledge':
+        if cfg.vision_mode == 'navKnowledge':
             self.navKnowledge.to_csv(os.path.join(self.save_dir, f"navKnowledge_{tag}.csv"), index=False)
         else:
             pose = self.get_robot_pose(warn=False)
-            self.object_map.plot_mle(os.path.join(self.save_dir, f"object_map_{step_count:03d}.png"),
+            self.object_map.plot_mle(self.out_path("object_map", f"object_map_{step_count:03d}.png"),
                                      title=f"Object map (MLE), step {step_count}",
                                      robot_xz=pose[:2] if pose else None)
 
@@ -269,3 +275,8 @@ class TB4FusionController(TB4BaseController):
             self.navKnowledge.to_csv(os.path.join(self.save_dir, "navKnowledge_final.csv"), index=False)
         elif self.object_map is not None:
             self.object_map.save_final(self.save_dir)
+
+    def out_path(self, folder, filename):
+        d = os.path.join(self.save_dir, folder)
+        os.makedirs(d, exist_ok=True)
+        return os.path.join(d, filename)

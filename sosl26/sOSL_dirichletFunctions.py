@@ -51,6 +51,8 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 from scipy.special import digamma  # noqa: E402
 
+from matplotlib.colors import ListedColormap  # noqa: E402
+
 BACKGROUND = 'Background'
 
 def confusion_matrix_from_normalized(classes, matrix, labels, bg_fp_rate=0.05,
@@ -90,7 +92,10 @@ class DirichletObjectMap:
     def __init__(self, x_points, z_points, classes, confusion_matrix,
                  background=BACKGROUND, conf_temper=1.0,
                  bg_false_neg_rate=0.15, bg_dist_decay=0.5,
-                 prior_strength=1.0, min_radius=None, max_radius=1.0):
+                 prior_strength=1.0, min_radius=None, max_radius=1.0,
+                 class_colors=None, gt_positions=None):
+        # class_colors: {class name: matplotlib color} (case-insensitive, incl. 'Background')
+        # gt_positions: {class name: (map x, map y)} ground-truth object positions
         """
         Parameters
         ----------
@@ -143,6 +148,9 @@ class DirichletObjectMap:
         self.Xc, self.Zc = np.meshgrid(self.x_points, self.z_points)   # cell centres, (H, W)
         self.class_weights = None
         self.similarity_table = None
+
+        self.class_colors = {str(k).lower(): v for k, v in (class_colors or {}).items()}
+        self.gt_positions = dict(gt_positions or {})
 
     # ------------------------------------------------------------------
     # Evidence accumulation
@@ -306,28 +314,48 @@ class DirichletObjectMap:
     # Saving
     # ------------------------------------------------------------------
 
+    def _color(self, name):
+        c = self.class_colors.get(str(name).lower())
+        if c is not None:
+            return c
+        return plt.get_cmap('tab20')(self.cls_idx.get(name, 0) % 20)
+
+    def overlay_ground_truth(self, ax):
+        """Stars at the ground-truth object positions, filled with the class color.
+        Positions outside the map extent are simply clipped."""
+        if not self.gt_positions:
+            return
+        xlim, ylim = ax.get_xlim(), ax.get_ylim()
+        for name, (gx, gy) in self.gt_positions.items():
+            ax.plot(gx, gy, marker='*', ms=18, mfc=self._color(name), mec='white', mew=1.5,
+                    ls='', zorder=6)
+            ax.annotate(name, (gx, gy), xytext=(0, 10), textcoords='offset points', ha='center',
+                        fontsize=8, zorder=7, bbox=dict(boxstyle='round,pad=0.15', fc='white', alpha=0.85))
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
+
     def _extent(self):
         h = self.res / 2.0
         return [self.x_points[0] - h, self.x_points[-1] + h, self.z_points[0] - h, self.z_points[-1] + h]
 
     def plot_mle(self, save_path, title='MLE class  argmax p(o | z)', robot_xz=None):
-        """Class map of observed cells; grey = never observed."""
+        """Class map of observed cells in the class colors; grey = never observed."""
         mle = self.mle_class()
         present = sorted(set(mle[mle >= 0].tolist()))
         fig, ax = plt.subplots(figsize=(7.5, 6))
         ax.set_facecolor((0.85, 0.85, 0.85))
         if present:
-            lut = {k: i for i, k in enumerate(present)}
             img = np.full(mle.shape, np.nan)
-            for k, i in lut.items():
+            for i, k in enumerate(present):
                 img[mle == k] = i
-            cmap = plt.get_cmap('tab20', max(len(present), 2))
+            cmap = ListedColormap([self._color(self.classes[k]) for k in present])
             im = ax.imshow(img, origin='lower', extent=self._extent(), cmap=cmap,
-                           vmin=-0.5, vmax=max(len(present), 2) - 0.5, aspect='equal')
+                           vmin=-0.5, vmax=len(present) - 0.5, aspect='equal')
             cb = fig.colorbar(im, ax=ax, ticks=range(len(present)))
             cb.ax.set_yticklabels([self.classes[k] for k in present])
+        self.overlay_ground_truth(ax)
         if robot_xz is not None:
-            ax.plot(robot_xz[0], robot_xz[1], marker='o', ms=8, mfc='lime', mec='black', ls='')
+            ax.plot(robot_xz[0], robot_xz[1], marker='o', ms=8, mfc='lime', mec='black', ls='', zorder=8)
         ax.set_title(title)
         ax.set_xlabel('map x (m)')
         ax.set_ylabel('map y (m)')
@@ -360,6 +388,7 @@ class DirichletObjectMap:
             fig, ax = plt.subplots(figsize=(7, 5.5))
             im = ax.imshow(post[:, :, k], origin='lower', extent=extent, cmap='magma', vmin=0, vmax=1,
                            aspect='equal')
+            self.overlay_ground_truth(ax)
             ax.set_title(f'p(o = {cls} | z)')
             fig.colorbar(im, ax=ax, label='probability')
             fig.tight_layout()
@@ -374,12 +403,12 @@ class DirichletObjectMap:
                                 'sum_k p(o_k|z) * sim(class_k, goal)')]:
             fig, ax = plt.subplots(figsize=(7, 5.5))
             im = ax.imshow(arr, origin='lower', extent=extent, cmap='viridis', aspect='equal')
+            self.overlay_ground_truth(ax)
             ax.set_title(lab)
             fig.colorbar(im, ax=ax)
             fig.tight_layout()
             fig.savefig(os.path.join(maps_dir, f'{name}.png'), dpi=120)
             plt.close(fig)
-
 
 def camera_pose_in_map(optical_to_map):
     """Camera (x, y) and optical-axis yaw in the map frame from an optical->map transform."""

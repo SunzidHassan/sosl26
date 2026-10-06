@@ -143,6 +143,10 @@ class ExperimentConfig:
 
     show_window: bool = True
 
+    # --- Ground truth / plotting ---
+    object_positions: Optional[Dict[str, Tuple[float, float]]] = None  # {class: (map x, map y)}
+    object_colors: Optional[Dict[str, str]] = None                     # {class: matplotlib color}
+
     def resolved_goal_phrase(self):
         return self.goal_phrase or f"Is emitting {self.odor} odor:"
 
@@ -526,6 +530,14 @@ class TB4BaseController(Node):
         return dict(raw=raw, concentration=self.rescale_concentration(raw), raw_std=raw_std,
                     n_readings=len(window), wind_direction=wind_dir, wind_speed=wind_speed)
 
+    def path_so_far(self, pose):
+        """Robot path: every pose recorded with an /olfaction reading, else the step poses, plus the current pose."""
+        pts = [(r["robot_x"], r["robot_z"]) for r in self.olfaction_raw if np.isfinite(r["robot_x"])]
+        if not pts:
+            pts = [(r["robot_x"], r["robot_z"]) for r in self.trajectory_log_list]
+        pts.append((pose[0], pose[1]))
+        return pts
+
     def run_step(self, pose):
         cfg = self.cfg
         g = self.grid
@@ -573,7 +585,8 @@ class TB4BaseController(Node):
         tag = f"{step_count:03d}_x_{robot_x:.2f}_z_{robot_z:.2f}"
         panels = [(srcProbGivenOlfactory, rf'$H_C={olfactoryEntropy:.2f}$')] + result["panels"]
         try:
-            save_belief_maps(panels, g.x_points, g.z_points, os.path.join(self.save_dir, f"maps_all_{tag}.png"))
+            save_belief_maps(panels, g.x_points, g.z_points, os.path.join(self.save_dir, f"maps_all_{tag}.png"),
+                             trajectory=self.path_so_far(pose))
         except Exception as e:
             self.get_logger().error(f"Error saving belief map plot at step {step_count}: {e}")
         np.savez_compressed(os.path.join(self.save_dir, f"maps_{step_count:03d}.npz"),

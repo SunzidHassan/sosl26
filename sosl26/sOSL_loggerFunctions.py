@@ -12,6 +12,8 @@ import math
 
 from sOSL_olfactionFunctions import gaussian_plume
 
+from matplotlib.colors import to_rgb
+
 from sOSL_utils import (
     world_to_grid
 )
@@ -20,7 +22,7 @@ from sOSL_utils import (
 # Plotting Functions
 # ==========================
 
-def plot_detected_objects(itemDF, mask_closed, scene_bounds_tuple, save_path=None):
+def plot_detected_objects(itemDF, mask_closed, scene_bounds_tuple, save_path=None, gt_objects=None, class_colors=None):
     """
     Generates a top-down map showing the reachable area and labels for
     objects detected by the vision branch.
@@ -62,23 +64,25 @@ def plot_detected_objects(itemDF, mask_closed, scene_bounds_tuple, save_path=Non
          print("Warning: mask_closed is not valid. Skipping overlay.")
 
     # (B) Plot Object Labels from itemDF
+    colors = {str(k).lower(): v for k, v in (class_colors or {}).items()}
     for _, row in itemDF.iterrows():
         name = row.get('objectType', 'N/A')
         pos_str = row.get('Position', None)
-
         if pos_str is None or not isinstance(pos_str, str):
             continue
-
         try:
             x, y, z = map(float, pos_str.split(','))
-            ax.text(x, z, name,
-                     fontsize=8,
-                     ha='center', va='center',
-                     zorder=3, color='black',
-                     bbox=dict(facecolor='yellow', alpha=0.8, pad=0.1, boxstyle='round,pad=0.2'))
-
+            fc = colors.get(str(name).lower(), 'yellow')
+            r, g, b = to_rgb(fc)
+            tc = 'black' if 0.299 * r + 0.587 * g + 0.114 * b > 0.6 else 'white'
+            ax.text(x, z, name, fontsize=8, ha='center', va='center', zorder=3, color=tc,
+                    bbox=dict(facecolor=fc, alpha=0.85, pad=0.1, boxstyle='round,pad=0.2'))
         except (ValueError, TypeError, AttributeError):
             print(f"Could not parse position for {name}: {pos_str}")
+
+    for name, (gx, gy) in (gt_objects or {}).items():     # ground truth (map x, map y)
+        ax.plot(gx, gy, marker='*', ms=18, mfc=colors.get(str(name).lower(), 'gray'), mec='black',
+                mew=1.2, ls='', zorder=4)
 
     # (C) Final touches
     ax.set_xlabel('Robot X Position (m)')

@@ -470,7 +470,7 @@ def _minmax(m):
     return (m - lo) / (hi - lo) if hi - lo > 1e-12 else np.zeros_like(m)
 
 
-def save_belief_maps(panels, x_points, z_points, out_fname):
+def save_belief_maps(panels, x_points, z_points, out_fname, trajectory=None):
     """Saves a row of belief maps, e.g. olfactory / visual / fused.
 
     Same rendering as the belief map block in fusion_controller.py (each map
@@ -496,6 +496,11 @@ def save_belief_maps(panels, x_points, z_points, out_fname):
         ax.set_xlim(xmin, xmax)
         ax.set_ylim(zmin, zmax)
         ax.set_aspect('equal', adjustable='box')
+        if trajectory is not None and len(trajectory) > 0:
+            tx, tz = zip(*trajectory)
+            ax.plot(tx, tz, '-', color='cyan', linewidth=1.5, zorder=4)
+            ax.plot(tx[0], tz[0], 'o', ms=8, mfc='lime', mec='black', zorder=5)     # start
+            ax.plot(tx[-1], tz[-1], 'o', ms=8, mfc='cyan', mec='black', zorder=5)   # current    
 
         divider = make_axes_locatable(ax)
         cax = divider.append_axes("right", size="5%", pad=0.1)
