@@ -76,19 +76,19 @@ def main(args=None):
     run_time_limit = None            # seconds, None = until Ctrl+C / 'q'
 
     # Olfactory (Gaussian plume) parameters
-    q_s = 8000
-    D = 10
+    q_s = 6.48
+    D = 0.004
     tau = 1000.0
-    sigma_noise = 200                 # std of the sensor noise, in rescaled units
+    sigma_noise = 100                 # std of the sensor noise, in rescaled units
 
     # Rescaling of raw /olfaction readings: min -> 0, max -> 100 (same as the offline a * raw + b).
     # Each can be a number or the path of an olfaction_data.csv, whose mean chemicalConc is used.
-    olfaction_max_conc = 500
-    olfaction_min_conc = 300         # dummy min (measured: 'testData/2026-09-15_sensorDump_low/olfaction_data.csv')
+    olfaction_max_conc = 610
+    olfaction_min_conc = 400         # dummy min (measured: 'testData/2026-09-15_sensorDump_low/olfaction_data.csv')
 
     # Map / ground truth (ROS map frame)
     map_bounds = None                # (x_min, x_max, y_min, y_max); None = use /map
-    source_position = None           # ground-truth source (x, y) if known, for evaluation only
+    source_position = (-6.4, -0.5)           # ground-truth source (x, y) if known, for evaluation only
 
     # Vision
     yolo_model_path = "models/YOLO/neth234YOLO26m100epoch.pt"
