@@ -20,10 +20,9 @@ class ExperimentConfig:
     # ------------------------------------------------------------------
     # Task
     # ------------------------------------------------------------------
-    alg_choice: str = 'F'                # 'F' = fusion (olfaction + vision), 'O' = olfactory-only
-    vision_mode: str = 'dirichlet'       # 'F' only: 'navKnowledge' (AI2-THOR object list) or 'dirichlet' (object map)
+    alg_choice: str = 'F'                # 'F' = fusion (olfaction + Dirichlet object map), 'O' = olfactory-only
     odor: str = "burnt"                  # used in the goal phrase and the save folder name
-    goal_phrase: Optional[str] = None    # text compared with object names; None -> "Is emitting {odor} odor:"
+    goal_phrase: Optional[str] = None    # text compared with class names; None -> "Is emitting {odor} odor:"
     entropy_frac: float = 0.8            # behaviour switches to "goal_navigation" once the olfactory
                                          # entropy drops below entropy_frac * (entropy of a uniform map)
 
@@ -72,12 +71,11 @@ class ExperimentConfig:
     yolo_exclude_classes: Sequence[str] = field(default_factory=list)  # always drop these classes
     depth_percentile: float = 50.0       # percentile of the depth pixels inside a box used as the object's depth
     depth_range: Tuple[float, float] = (0.2, 5.0)  # valid depth (m); also the max range of background evidence
-    merge_dist: float = 0.1              # navKnowledge: same-class detections closer than this (m) are averaged
     camera_hfov_deg: float = 69.0        # only used until /oakd/rgb/camera_info arrives
     camera_height: float = 0.25          # only used if the camera TF frame is unavailable
     save_vision_frames: bool = True      # save the annotated YOLO image of every processed frame
 
-    # Dirichlet object map (vision_mode 'dirichlet'), see sOSL_dirichletFunctions.py
+    # Dirichlet object map, see sOSL_dirichletFunctions.py
     dirichlet_object_evidence: float = 1.0      # added to an object's class, per frame, in its footprint cells
     dirichlet_background_evidence: float = 0.5  # added to Background, per frame, in empty cells camera -> object
     dirichlet_prior_strength: float = 1.0       # uniform prior: each class starts at prior_strength / K
@@ -106,8 +104,6 @@ class ExperimentConfig:
     def validate(self):
         if self.alg_choice not in ('F', 'O'):
             raise ValueError(f"alg_choice must be 'F' or 'O', got '{self.alg_choice}'")
-        if self.vision_mode not in ('navKnowledge', 'dirichlet'):
-            raise ValueError(f"vision_mode must be 'navKnowledge' or 'dirichlet', got '{self.vision_mode}'")
         if (self.olfaction_min_conc is None) != (self.olfaction_max_conc is None):
             raise ValueError("Set both olfaction_min_conc and olfaction_max_conc, or neither.")
         if self.olfaction_min_conc is not None and self.olfaction_max_conc == self.olfaction_min_conc:

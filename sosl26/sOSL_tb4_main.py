@@ -6,8 +6,7 @@ Set the experiment in main() below; every option and its default is explained in
 tb4_config.py. Drive the robot with keyboard teleop
 (`ros2 run teleop_twist_keyboard teleop_twist_keyboard`) and stop it during each
 step window. End the run with Ctrl+C or 'q' in the YOLO window. Results go to
-    <sosl26>/save/save_F_{Odor}_{vision_mode}/{entropy_frac}/{run}/   (fusion)
-    <sosl26>/save/save_O_{Odor}/{entropy_frac}/{run}/                 (olfactory-only)
+    <sosl26>/save/save_{F|O}_{Odor}/{entropy_frac}/{run}/
 """
 
 import os
@@ -38,8 +37,7 @@ YOLO_MODEL_PATH = "yolo26m.pt"   # pretrained YOLO26m (ultralytics downloads it 
 def main(args=None):
     # ===================== Experiment =====================
     cfg = ExperimentConfig(
-        alg_choice='O',                  # 'F' fusion (olfaction + vision) | 'O' olfactory-only
-        vision_mode='dirichlet',         # 'F' only: 'navKnowledge' | 'dirichlet'
+        alg_choice='O',                  # 'F' fusion (olfaction + Dirichlet object map) | 'O' olfactory-only
         odor="burnt",
         entropy_frac=0.8,
 
@@ -90,7 +88,7 @@ def main(args=None):
 
 
 def make_run_dir(cfg):
-    """Creates save/save_{alg}_{Odor}[_{vision_mode}]/{entropy_frac}/{n} with n = next free run number.
+    """Creates save/save_{alg}_{Odor}/{entropy_frac}/{n} with n = next free run number.
 
     `save` is in the sosl26 source folder when running from the source tree
     (colcon build --symlink-install), otherwise in the current directory.
@@ -100,7 +98,7 @@ def make_run_dir(cfg):
                              "save")
 
     odor_tag = re.sub(r"[^A-Za-z0-9]+", "", cfg.odor.title())        # "burnt" -> "Burnt"
-    alg_folder = f"save_{cfg.alg_choice}_{odor_tag}" + (f"_{cfg.vision_mode}" if cfg.alg_choice == 'F' else "")
+    alg_folder = f"save_{cfg.alg_choice}_{odor_tag}"
     base = os.path.join(save_root, alg_folder, str(cfg.entropy_frac))
     os.makedirs(base, exist_ok=True)
 

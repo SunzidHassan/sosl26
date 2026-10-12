@@ -54,7 +54,6 @@ from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 
-from sOSL_loggerFunctions import map_entropy
 from sOSL_olfactionFunctions import gaussian_plume
 from sOSL_tb4Functions import (
     TB4BayesianAgent,
@@ -63,16 +62,19 @@ from sOSL_tb4Functions import (
     format_position,
     grid_from_bounds,
     grid_from_occupancy,
+    grid_to_world,
     intrinsics_from_fov,
+    map_entropy,
     optical_to_map_from_robot_pose,
+    parse_position_string,
     plot_tb4_trajectory,
     ros_yaw_to_ai2thor_deg,
     save_belief_maps,
     scale_intrinsics,
     transform_point,
+    world_to_grid,
     yaw_from_quaternion,
 )
-from sOSL_utils import grid_to_world, parse_position_string, world_to_grid
 from sosl26.tb4_config import ExperimentConfig
 from sosl26.tb4_vision import StepEstimate, Vision
 
@@ -149,7 +151,7 @@ class TB4Controller(Node):
             self.create_timer(cfg.vision_period, self.vision_callback, callback_group=self.processing_group)
         self.show_window = cfg.show_window and self.uses_camera
 
-        mode = f"fusion ({cfg.vision_mode})" if self.uses_camera else "olfactory-only"
+        mode = "fusion (olfaction + Dirichlet vision)" if self.uses_camera else "olfactory-only"
         self.get_logger().info(
             f"sOSL TB4 controller started: {mode}. Goal: '{self.goal_phrase}', step window {cfg.sample_period}s, "
             f"plume q_s={cfg.q_s}, D={cfg.D}, tau={cfg.tau}. Saving to {save_dir}")
@@ -528,7 +530,7 @@ class TB4Controller(Node):
         Parameters
         ----------
         behavior_flag : "Initialization", "search" or "goal_navigation" (fusion_controller.py semantics)
-        target_xz : map (x, y) of the current estimate (best object, fused or olfactory maximum), or None
+        target_xz : map (x, y) of the current estimate (fused maximum for 'F', olfactory maximum for 'O')
         olfactory_max_xz : map (x, y) of the most likely cell of the olfactory map
         pose : robot (x, y, yaw) in the map frame, yaw in the ROS convention (rad, CCW from +x)
 

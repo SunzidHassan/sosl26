@@ -1,14 +1,14 @@
 """ROS-free helpers for running the sOSL pipeline on a TurtleBot4.
 
-The AI2-THOR code (sOSL_*Functions.py) reads everything from an ai2thor
-`controller`. The functions here do the same jobs from plain TB4 sensor data,
-so the rest of the pipeline (BayesianAgent, add_goal_similarity,
-generate_heatmap, map_entropy, plot_detected_objects, ...) is reused as is.
+The AI2-THOR code reads everything from an ai2thor `controller`. The functions
+here do the same jobs from plain TB4 sensor data, so the olfaction code
+(sOSL_olfactionFunctions.BayesianAgent, gaussian_plume) is reused as is.
 Nothing here imports rclpy, so everything can be tested offline.
 
 Sections
 --------
   Pose / frame helpers   yaw conversions, Position strings
+  Grid / map helpers     world <-> grid cell, map entropy
   Image decoding         CompressedImage / compressedDepth -> numpy arrays
   Camera model           intrinsics, box depth, pixel -> optical frame -> map frame
   Olfaction              TB4BayesianAgent: BayesianAgent with configurable plume parameters
@@ -99,6 +99,111 @@ def format_position(map_x, map_y, map_z):
 
 
 # ==========================
+# Grid / Map Helpers (copied unchanged from the AI2-THOR sOSL_utils.py / sOSL_loggerFunctions.py)
+# ==========================
+
+def parse_position_string(pos_str):
+    """Converts a position string "x, y, z" into a NumPy array.
+
+    Parameters
+    ----------
+    pos_str : str
+        A string containing three comma-separated float values (e.g., "1.0, 0.9, -2.5").
+
+    Returns
+    -------
+    np.ndarray
+        A NumPy array of shape (3,) containing the [x, y, z] coordinates as floats.
+    """
+    # Expecting a string like "x, y, z"
+    return np.array([float(val.strip()) for val in pos_str.split(',')])
+
+
+def world_to_grid(x, z, x_points, z_points):
+    """Converts world coordinates (x, z) to the nearest grid cell indices.
+
+    Finds the indices corresponding to the closest values in the `x_points`
+    and `z_points` arrays.
+
+    Parameters
+    ----------
+    x : float
+        The world x-coordinate.
+    z : float
+        The world z-coordinate.
+    x_points : np.ndarray
+        A 1D array of the x-coordinates defining the grid columns.
+    z_points : np.ndarray
+        A 1D array of the z-coordinates defining the grid rows.
+
+    Returns
+    -------
+    np.ndarray
+        A NumPy array of shape (2,) containing the [row_index, column_index].
+    """
+    col = (np.abs(x_points - x)).argmin()
+    row = (np.abs(z_points - z)).argmin()
+    return np.array([row, col])
+
+
+def grid_to_world(pos, x_points, z_points):
+    """Converts grid cell indices [row, col] back to world coordinates (x, z).
+
+    Parameters
+    ----------
+    pos : np.ndarray or list-like
+        The grid cell indices [row_index, column_index].
+    x_points : np.ndarray
+        A 1D array of the x-coordinates defining the grid columns.
+    z_points : np.ndarray
+        A 1D array of the z-coordinates defining the grid rows.
+
+    Returns
+    -------
+    np.ndarray
+        A NumPy array of shape (2,) containing the world [x, z] coordinates
+        corresponding to the center of the grid cell.
+    """
+    row, col = pos
+    return np.array([x_points[col], z_points[row]])
+
+
+def map_entropy(raw):
+    """Calculates the Shannon entropy of a raw (unnormalized) 2D map.
+
+    Flattens the map, normalizes it to sum to 1, removes zero probabilities,
+    and then calculates the entropy: -sum(p * log2(p)).
+
+    Parameters
+    ----------
+    raw : np.ndarray
+        The 2D input map (e.g., a heatmap or probability map). Values should be non-negative.
+
+    Returns
+    -------
+    float
+        The calculated entropy in bits. Returns 0 if the map sum is zero.
+    """
+    p = raw.flatten()
+    map_sum = p.sum()
+
+    if map_sum < 1e-12: # Check if map sum is effectively zero
+        return 0.0 # Entropy of an empty/zero distribution is 0
+
+    p = p / map_sum     # normalize
+    # p = scaler.fit_transform(p)  # Scale to [0, 1]
+    p = p[p > 1e-12]    # drop zeros/near-zeros to avoid log2(0) issues
+
+    if p.size == 0: # Check if only zeros were present
+        return 0.0
+
+    return -np.sum(p * np.log2(p))
+
+
+# --- FUNCTION TO GENERATE TRAJECTORY PLOT ---
+
+
+# ==========================
 # Image Decoding
 # ==========================
 
@@ -166,7 +271,7 @@ def boxDepth(x, y, w, h, depth_m, rgb_shape, percentile=50, shrink=0.5,
              min_depth=0.2, max_depth=5.0):
     """Estimates an object's depth (m) from its bounding box.
 
-    TB4 version of sOSL_visionFunctions.boxDepth. The RGB bounding box is
+    TB4 version of the AI2-THOR boxDepth. The RGB bounding box is
     rescaled to the depth image resolution, shrunk around its center (real
     boxes contain a lot of background), and the requested percentile of the
     valid depth pixels is returned. Returns 0.0 when no valid depth exists.
@@ -423,7 +528,7 @@ def plot_tb4_trajectory(trajectory_log_path, grid, save_path, source_xz=None,
                         estimate_xz=None, plume_params=None):
     """Top-down trajectory plot on the TB4 map.
 
-    TB4 counterpart of sOSL_loggerFunctions.generate_trajectory_plot (which
+    TB4 counterpart of the AI2-THOR generate_trajectory_plot (which
     needs an ai2thor controller). Draws the plume field when the ground truth
     source is known, greys out non-free map cells, and marks start (lime),
     end (cyan), source (red star, 1 m success circle) and the final estimate.

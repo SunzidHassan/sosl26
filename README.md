@@ -10,10 +10,10 @@ This is the TB4 port of the AI2-THOR `sOSL_main.py` / `fusion_controller.py` pip
 | `sOSL_tb4_main.py` | **Edit this:** the experiment parameters in `main()`, then starts the run |
 | `tb4_config.py` | `ExperimentConfig`: every parameter, its default and what it does |
 | `tb4_controller.py` | The ROS node: sensors, step loop, olfactory update, saving, `navigate()` stub |
-| `tb4_vision.py` | Camera branch (`'F'` only): YOLO → objects in the map → `navKnowledge` or Dirichlet fusion |
+| `tb4_vision.py` | Camera branch (`'F'` only): YOLO → objects in the map → Dirichlet object map → fusion with olfaction |
 | `sOSL_dirichletFunctions.py` | Dirichlet object map |
-| `sOSL_tb4Functions.py` | ROS-free helpers: image decoding, camera geometry, `TB4BayesianAgent`, search grid, plots |
-| `sOSL_olfactionFunctions.py`, `sOSL_visionFunctions.py`, `sOSL_utils.py`, `sOSL_loggerFunctions.py` | Unchanged copies of the AI2-THOR code base (the package `__init__` makes their flat imports work) |
+| `sOSL_tb4Functions.py` | ROS-free helpers: image decoding, camera geometry, `TB4BayesianAgent`, search grid, map entropy, plots |
+| `sOSL_olfactionFunctions.py` | Unchanged copy of the AI2-THOR olfaction code (`gaussian_plume`, `BayesianAgent`) |
 
 How a step flows: `tb4_controller.TB4Controller.step_callback` → `run_step` (olfaction) → `Vision.fuse` (`'F'`) →
 `navigate` → save. During the step window, `vision_callback` → `Vision.process_frame` handles each camera frame.
@@ -21,10 +21,7 @@ How a step flows: `tb4_controller.TB4Controller.step_callback` → `run_step` (o
 ## Experiments (set in `main()`)
 
 - `alg_choice = 'O'`: olfactory-only. Each step saves the Bayesian map. The estimate is its arg-max cell.
-- `alg_choice = 'F'`, `vision_mode = 'navKnowledge'`: the AI2-THOR approach as is. It builds an object list, then
-  `add_goal_similarity` scores each object as `goalSim = langSim * olfactionSim`.
-- `alg_choice = 'F'`, `vision_mode = 'dirichlet'`: builds a per-cell Dirichlet class distribution over the YOLO classes plus
-  Background.
+- `alg_choice = 'F'`: fusion. Builds a per-cell Dirichlet class distribution over the YOLO classes plus Background.
   - It starts from a uniform prior (`prior_strength / K`).
   - Each detection adds +1 to its class over a footprint of radius half the metric bbox width (`bbox_w_px * depth / fx / 2`).
   - Cells between the camera and each detection, inside the FOV and map bounds, get +0.5 Background.
@@ -51,9 +48,8 @@ Each step is a window of `sample_period` seconds (`n`, default 5 s). Stop the ro
 - **Olfaction:** every `/olfaction` message in the window (`Vector3`: x = wind direction, y = wind speed, z = concentration)
   is averaged. The Bayesian map is updated once per step with that mean, at the pose at the end of the window.
 - **Vision (`'F'`):** YOLO runs on every new frame, at most one per `vision_period` (default 0.5 s), throughout the window.
-  Each frame is projected with the pose at that moment. Its detections are merged into `envKnowledge`, and in Dirichlet
-  mode each frame adds its own evidence (+1 per detection footprint, +0.5 per background cell). A 5 s window therefore
-  adds up to about 10 evidence per object.
+  Each frame is projected with the pose at that moment and adds its own evidence to the object map (+1 per detection
+  footprint, +0.5 per background cell). A 5 s window therefore adds up to about 10 evidence per object.
 - **End of the step:** maps are fused and saved, and `navigate()` is called. `navigate()` does nothing yet, and the node
   never publishes `/cmd_vel`, so teleop keeps control.
 
@@ -74,15 +70,15 @@ Before the Bayesian update, raw `/olfaction` concentrations are rescaled linearl
 
 ## Outputs
 
-`<sosl26>/save/save_F_{Odor}_{vision_mode}/...` or `save_O_{Odor}/...`, then `{entropy_frac}/{run}/` (with `--symlink-install`; otherwise `./save`):
+`<sosl26>/save/save_{F|O}_{Odor}/{entropy_frac}/{run}/` (with `--symlink-install`; otherwise `./save`):
 
 - `trajectory_log.csv`: one row per step, with the same columns as the AI2-THOR runs plus wind, the olfactory arg-max and time
-- `maps_all_XXX_x_.._z_...png`: the olfactory, visual (`langSim`) and fused (`goalSim`) maps, plus `maps_XXX.npz` with the raw arrays
-- `navKnowledge_XXX_*.csv`, `detected_objects_map_XXX.png`, `yolo_{step}_{frame}.jpg` (every processed frame; `save_vision_frames`), and `frame_*.png` / `depth_XXX.png` (mm) for the last frame of each step
-- `envKnowledge_final.csv`, `navKnowledge_final.csv`, `detections_log.csv` (every detection), `olfaction_raw.csv` (every `/olfaction` message), `trajectory_plot.png`, `run_config.json`
-- Dirichlet mode:
+- `maps_all_XXX_x_.._z_...png`: the olfactory, visual `P(src | V)` and fused maps, plus `maps_XXX.npz` with the raw arrays
+- `olfaction_raw.csv` (every `/olfaction` message), `trajectory_plot.png`, `run_config.json`
+- Fusion (`'F'`) also writes:
   - Each step: `object_map_XXX.png` (MLE class map; grey means never observed), plus `beta`, `observed` and `mle_class` in `maps_XXX.npz`.
-  - At the end: `dirichlet_final.npz`, `dirichlet_classes.json`, `semantic_similarity_table.csv`, and `dirichlet_maps/` (per-class posteriors, MLE, entropies, semantic likelihood).
+  - Each step: `yolo_{step}_{frame}.jpg` for every processed frame (`save_vision_frames`), and `frame_*.png` / `depth_XXX.png` (mm) for the last frame of the step.
+  - At the end: `detections_log.csv` (every detection), `dirichlet_final.npz`, `dirichlet_classes.json`, `semantic_similarity_table.csv`, and `dirichlet_maps/` (per-class posteriors, MLE, entropies, semantic likelihood).
 - Olfactory-only: `maps_all_*` has one panel and `maps_XXX.npz` holds only the olfactory map. No frames or detections are saved.
 
 **Axis convention:** to reuse the AI2-THOR functions unchanged, ROS map `y` is stored as the AI2-THOR `z` axis.
