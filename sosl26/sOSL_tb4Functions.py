@@ -1,44 +1,47 @@
-"""TurtleBot4 adapters for the sOSL olfaction / vision pipeline.
+"""ROS-free helpers for running the sOSL pipeline on a TurtleBot4.
 
-The AI2-THOR functions in sOSL_visionFunctions.py read everything from an
-ai2thor `controller`. This module provides the TB4 equivalents that work on
-plain sensor data (decoded images, camera intrinsics, TF poses), so the rest
-of the pipeline (BayesianAgent, add_goal_similarity, generate_heatmap,
-map_entropy, plot_detected_objects, ...) is reused unchanged.
+The AI2-THOR code (sOSL_*Functions.py) reads everything from an ai2thor
+`controller`. The functions here do the same jobs from plain TB4 sensor data,
+so the rest of the pipeline (BayesianAgent, add_goal_similarity,
+generate_heatmap, map_entropy, plot_detected_objects, ...) is reused as is.
+Nothing here imports rclpy, so everything can be tested offline.
 
-Nothing in this module imports rclpy, so it can be tested offline.
+Sections
+--------
+  Pose / frame helpers   yaw conversions, Position strings
+  Image decoding         CompressedImage / compressedDepth -> numpy arrays
+  Camera model           intrinsics, box depth, pixel -> optical frame -> map frame
+  Olfaction              TB4BayesianAgent: BayesianAgent with configurable plume parameters
+  Search grid            grid cells + reachable mask from /map (or fixed bounds)
+  Maps + plots           belief-map figure, trajectory plot
 
 Coordinate convention
 ---------------------
 The AI2-THOR pipeline works on the (x, z) ground plane with y pointing up and
 stores object positions as the string "x, y, z". To reuse those functions
-as-is, ROS `map` frame coordinates are mapped as:
+unchanged, ROS `map` coordinates are stored as:
 
     ai2thor x  <-  map x
     ai2thor y  <-  map z   (height)
     ai2thor z  <-  map y
 
-So `robot_z`, `z_points` and the third entry of a "Position" string are all
+So `robot_z`, `z_points` and the third value of a "Position" string are all
 the ROS map *y* coordinate.
 
 Handedness: AI2-THOR/Unity is left-handed (x right, y up, z forward), ROS
-(REP 103) is right-handed (x forward, y left, z up). Swapping the y and z
-axes as above is exactly the right-to-left-handed conversion, so positions
-map 1:1 and a top-down plot (x right, z/map-y up, origin='lower') shows the
-same picture in both. Only *angles* differ:
+(REP 103) is right-handed (x forward, y left, z up). Swapping y and z as above
+*is* the right-to-left-handed conversion, so positions map 1:1 and top-down
+plots (x right, map y up, origin='lower') look the same. Only angles differ:
 
     ROS yaw      : counter-clockwise from +x      (atan2(dy, dx))
     ai2thor yaw  : clockwise from +z (= map +y)   (atan2(dx, dz), rotation.y)
     ai2thor_yaw_deg = (90 - ros_yaw_deg) mod 360
 
-Use the ROS convention for anything sent to the robot (Nav2 goals,
-cmd_vel); use ros_yaw_to_ai2thor_deg() only for logs compared against the
-AI2-THOR runs. The camera projection here uses the ROS optical frame + TF
-and does not reuse the Unity-camera math of coord23D_focal.
+Use the ROS convention for anything sent to the robot (Nav2 goals, cmd_vel);
+ros_yaw_to_ai2thor_deg() is only for logs compared with the AI2-THOR runs.
 """
 
 import math
-import os
 import struct
 from dataclasses import dataclass, field
 
@@ -55,11 +58,9 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable  # noqa: E402
 from scipy.spatial.transform import Rotation  # noqa: E402
 
 from sOSL_olfactionFunctions import BayesianAgent, gaussian_plume  # noqa: E402
-from sOSL_loggerFunctions import generate_heatmap  # noqa: E402
 
-# Same font sizes as ControlAlgorithms/Fusion/fusion_controller.py
+# Same title size as ControlAlgorithms/Fusion/fusion_controller.py
 TITLE_FONTSIZE = 40
-LABEL_FONTSIZE = 32
 
 
 # ==========================
@@ -90,7 +91,10 @@ def ros_heading_to(robot_xy, target_xy):
 
 
 def format_position(map_x, map_y, map_z):
-    """Formats a ROS map-frame point as an ai2thor style "x, y, z" string."""
+    """Formats a ROS map-frame point as an ai2thor style "x, y, z" string.
+
+    Note the order: map y goes last (ai2thor z) and the height in the middle.
+    """
     return f"{map_x:.2f}, {map_z:.2f}, {map_y:.2f}"
 
 
@@ -113,6 +117,7 @@ def decode_compressed_depth(data, fmt=""):
     Invalid pixels are returned as 0.
     """
     raw = bytes(data)
+    # Skip the header by locating the PNG signature (more robust than a fixed offset)
     png_start = raw.find(b'\x89PNG')
     if png_start < 0:
         png_start = 12
@@ -121,6 +126,7 @@ def decode_compressed_depth(data, fmt=""):
         return None
 
     if '32FC1' in fmt and png_start >= 12:
+        # Float depth is stored as quantised inverse depth: depth = A / (value - B)
         _, quant_a, quant_b = struct.unpack('<iff', raw[:12])
         img = img.astype(np.float32)
         depth = np.zeros_like(img)
@@ -167,10 +173,13 @@ def boxDepth(x, y, w, h, depth_m, rgb_shape, percentile=50, shrink=0.5,
     """
     if depth_m is None:
         return 0.0
+    # The box comes from the RGB image; the depth image can have another resolution
+    # (it must be aligned to the RGB camera, which the TB4 OAK-D driver does).
     rgb_h, rgb_w = rgb_shape[:2]
     frame_h, frame_w = depth_m.shape[:2]
     sx, sy = frame_w / rgb_w, frame_h / rgb_h
 
+    # Keep only the central `shrink` fraction of the box, where the object is
     cx, cy = x * sx, y * sy
     half_w, half_h = max(1.0, w * sx * shrink / 2.0), max(1.0, h * sy * shrink / 2.0)
     vMin = max(0, int(round(cy - half_h)))
@@ -180,6 +189,7 @@ def boxDepth(x, y, w, h, depth_m, rgb_shape, percentile=50, shrink=0.5,
     if vMin >= vMax or hMin >= hMax:
         return 0.0
 
+    # Ignore invalid pixels (0 / NaN) and readings outside the trusted range
     depth_values = depth_m[vMin:vMax, hMin:hMax]
     depth_values = depth_values[np.isfinite(depth_values)
                                 & (depth_values >= min_depth)
@@ -194,6 +204,7 @@ def pixel_to_optical(u, v, d, K):
 
     Optical frame (ROS REP 103): +X right, +Y down, +Z forward.
     """
+    # Pinhole model: a pixel offset from the image centre, scaled by depth / focal length
     fx, fy, cx, cy = K
     return np.array([(u - cx) * d / fx, (v - cy) * d / fy, d])
 
@@ -210,126 +221,26 @@ def optical_to_map_from_robot_pose(p_opt, robot_x, robot_y, robot_yaw,
     Assumes a level camera looking along the robot heading, like the yaw-only
     rotation in coord23D_focal.
     """
+    # Optical axes -> robot axes: forward = +Z, left = -X, up = -Y
     forward = p_opt[2] + camera_forward
     left = -p_opt[0]
     up = camera_height - p_opt[1]
+    # Robot axes -> map: rotate by the robot yaw and add its position
     c, s = math.cos(robot_yaw), math.sin(robot_yaw)
     return np.array([robot_x + forward * c - left * s,
                      robot_y + forward * s + left * c,
                      up])
 
 
-# ==========================
-# Vision Branch (TB4)
-# ==========================
+def camera_pose_in_map(optical_to_map):
+    """Camera (x, y) and optical-axis yaw in the map frame from an optical->map transform.
 
-def visionBranch(model, itemDF, rgb_bgr, depth_m, K, optical_to_map,
-                 save_dir=None, step_count=0, confThr=0.3,
-                 target_names=None, exclude_names=(), depth_percentile=50,
-                 depth_range=(0.2, 5.0), merge_dist=0.1, logger=print):
-    """TB4 version of sOSL_visionFunctions.visionBranch.
-
-    Runs YOLO on the latest RGB frame, projects every detection to the map
-    frame, and merges it into `itemDF` with the same logic as the AI2-THOR
-    version (average positions of same-class detections closer than
-    `merge_dist`, otherwise append a new row).
-
-    Parameters
-    ----------
-    optical_to_map : callable
-        Maps an optical-frame point (np.ndarray of 3) to a map-frame point
-        (map_x, map_y, map_z), or returns None when it cannot.
-
-    Returns
-    -------
-    tuple[pd.DataFrame, np.ndarray | None, list[dict]]
-        Updated itemDF, the annotated frame (BGR), and this frame's
-        detections: dicts with objectType, Conf, map_x, map_y, map_z,
-        depth (m) and radius (m, half the metric bounding box width, used as
-        the Dirichlet footprint radius).
+    The camera sits at the optical origin and looks along optical +Z, so mapping
+    those two points gives its position and heading.
     """
-    updated_itemDF = itemDF.copy()
-    detections = []
-    if rgb_bgr is None:
-        return updated_itemDF, None, detections
-
-    target_classes = None
-    if target_names:
-        target_classes = [idx for idx, name in model.names.items() if name in target_names]
-
-    results = model(rgb_bgr, verbose=False, conf=confThr, classes=target_classes)
-    annotated_img = results[0].plot()
-
-    for box in results[0].boxes:
-        confidence = box.conf[0].item()
-        if confidence <= confThr:
-            continue
-        class_id = int(box.cls[0].item())
-        className = model.names[class_id]
-        if className in exclude_names:
-            continue
-
-        x, y, w, h = box.xywh[0]
-        x_pix, y_pix, w_pix, h_pix = round(x.item()), round(y.item()), round(w.item()), round(h.item())
-
-        d = boxDepth(x_pix, y_pix, w_pix, h_pix, depth_m, rgb_bgr.shape,
-                     percentile=depth_percentile,
-                     min_depth=depth_range[0], max_depth=depth_range[1])
-        if d <= 0:
-            continue
-
-        p_map = optical_to_map(pixel_to_optical(x_pix, y_pix, d, K))
-        if p_map is None:
-            continue
-        map_x, map_y, map_z = (float(v) for v in p_map)
-
-        # Stored in ai2thor order: x, up, z(=map y)
-        new_position = np.array([map_x, map_z, map_y])
-        position_str = format_position(map_x, map_y, map_z)
-        radius = (w_pix / 2.0) * d / K[0]
-        detections.append(dict(objectType=className, Conf=confidence, map_x=map_x, map_y=map_y,
-                               map_z=map_z, depth=d, radius=radius))
-        logger(f"Detected {className} ({confidence:.2f}) at depth {d:.2f} m, radius {radius:.2f} m "
-               f"-> map ({map_x:.2f}, {map_y:.2f})")
-
-        cv2.putText(annotated_img, f"{d:.2f}m ({map_x:.2f}, {map_y:.2f})",
-                    (max(0, x_pix - w_pix // 2), min(annotated_img.shape[0] - 5, y_pix + 15)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-
-        # --- Same merge logic as the AI2-THOR visionBranch ---
-        updated = False
-        if not updated_itemDF.empty and 'objectType' in updated_itemDF.columns:
-            match_indices = updated_itemDF.index[updated_itemDF['objectType'] == className].tolist()
-            for idx in match_indices:
-                try:
-                    existing_position_str = updated_itemDF.loc[idx, 'Position']
-                    existing_position = np.array([float(val.strip()) for val in existing_position_str.split(',')])
-                    dist = np.linalg.norm(new_position - existing_position)
-                    if dist < merge_dist:
-                        avg_position = (new_position + existing_position) / 2.0
-                        updated_itemDF.loc[idx, 'Position'] = f"{avg_position[0]:.2f}, {avg_position[1]:.2f}, {avg_position[2]:.2f}"
-                        updated_itemDF.loc[idx, 'Conf'] = max(confidence, updated_itemDF.loc[idx, 'Conf'])
-                        updated = True
-                except Exception as e:
-                    logger(f"Error processing existing position for {className} at index {idx}: {e}")
-                    continue
-
-        if not updated:
-            new_row_df = pd.DataFrame({
-                "objectType": [className],
-                "Conf": [confidence],
-                "Position": [position_str],
-            })
-            updated_itemDF = pd.concat([updated_itemDF, new_row_df], ignore_index=True)
-
-    for col in ['objectType', 'Conf', 'Position']:
-        if col not in updated_itemDF.columns:
-            updated_itemDF[col] = pd.Series(dtype='object' if col != 'Conf' else 'float')
-
-    if save_dir is not None:
-        cv2.imwrite(os.path.join(save_dir, f"yolo_step{step_count}.jpg"), annotated_img)
-
-    return updated_itemDF, annotated_img, detections
+    origin = np.asarray(optical_to_map(np.zeros(3)), dtype=float)
+    ahead = np.asarray(optical_to_map(np.array([0.0, 0.0, 1.0])), dtype=float)
+    return (origin[0], origin[1]), math.atan2(ahead[1] - origin[1], ahead[0] - origin[0])
 
 
 # ==========================
@@ -353,18 +264,26 @@ class TB4BayesianAgent(BayesianAgent):
         return gaussian_plume(x, z, source, **self.plume_params)
 
     def posterior(self, current_odor_concentration, robot_x, robot_z, smooth_sigma=2.0):
+        """Same Bayes update as BayesianAgent.posterior, with self.plume_params.
+
+        For every cell: "if the source were here, what would the robot read?"
+        (plume model). Cells whose prediction is close to the actual reading
+        (within ~sigma_noise) gain probability.
+        """
         likelihood_map = np.zeros_like(self.prob_map)
         for iz, z_source in enumerate(self.z_points):
             for ix, x_source in enumerate(self.x_points):
                 expected = self.expected_concentration(robot_x, robot_z, (x_source, z_source))
                 likelihood_map[iz, ix] = self.likelihood(current_odor_concentration, expected, self.sigma_noise)
 
+        # posterior ∝ prior * likelihood, renormalised to sum to 1
         self.prob_map *= likelihood_map
 
         map_sum = np.sum(self.prob_map)
         if map_sum > 1e-9:
             self.prob_map /= map_sum
         else:
+            # Every cell was ruled out (readings inconsistent with the model): restart from uniform
             print("Warning: Probability map sum is close to zero after update.")
             self.prob_map = np.full((self.window_z, self.window_x), 1.0 / (self.window_z * self.window_x))
 
@@ -385,6 +304,7 @@ class SearchGrid:
 
 
 def _grid_points(lo, hi, step):
+    """Cell centres from lo to hi, snapped to multiples of `step` (as sOSL_main.py does)."""
     lo = np.floor(lo / step) * step
     hi = np.floor(hi / step) * step
     return np.round(np.arange(lo, hi + step / 2.0, step), 3)
@@ -417,6 +337,7 @@ def grid_from_occupancy(occ, resolution, origin_x, origin_y, step=0.25,
     if known_r.size == 0:
         raise ValueError("Occupancy grid has no known cells.")
 
+    # Bounding box of the known cells, plus a margin
     pad = int(math.ceil(margin / resolution))
     r0 = max(0, known_r.min() - pad)
     r1 = min(occ.shape[0], known_r.max() + 1 + pad)
@@ -429,11 +350,13 @@ def grid_from_occupancy(occ, resolution, origin_x, origin_y, step=0.25,
     min_z = origin_y + r0 * resolution
     max_z = origin_y + r1 * resolution
 
+    # Free = known and occupancy probability below free_thresh (%)
     free = (crop >= 0) & (crop < free_thresh)
 
     x_points = _grid_points(min_x, max_x, step)
     z_points = _grid_points(min_z, max_z, step)
 
+    # A grid cell is reachable if the map cell under its centre is free
     reachable = []
     for z in z_points:
         r = int((z - min_z) / resolution)
@@ -449,22 +372,8 @@ def grid_from_occupancy(occ, resolution, origin_x, origin_y, step=0.25,
 # Maps + Plots
 # ==========================
 
-def compute_maps(prob_map, navKnowledge, x_points, z_points):
-    """Returns (olfactory, visual, fused) maps on the search grid.
-
-    olfactory = Bayesian posterior; visual = langSim heatmap; fused = goalSim
-    heatmap -- the same three panels as fusion_controller.py.
-    """
-    if navKnowledge is not None and not navKnowledge.empty:
-        vision_raw = generate_heatmap(navKnowledge, x_points, z_points, weight_key='langSim', sigma=1)
-        goal_raw = generate_heatmap(navKnowledge, x_points, z_points, weight_key='goalSim', sigma=1)
-    else:
-        vision_raw = np.zeros_like(prob_map)
-        goal_raw = np.zeros_like(prob_map)
-    return prob_map.copy(), vision_raw, goal_raw
-
-
 def _minmax(m):
+    """Rescales a map to [0, 1] for display (an all-constant map becomes all 0)."""
     m = np.asarray(m, dtype=float)
     lo, hi = m.min(), m.max()
     return (m - lo) / (hi - lo) if hi - lo > 1e-12 else np.zeros_like(m)

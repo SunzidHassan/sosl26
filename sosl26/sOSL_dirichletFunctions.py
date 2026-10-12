@@ -36,7 +36,6 @@ olfactory map (z = ROS map y, see sOSL_tb4Functions.py), so all maps align.
 """
 
 import json
-import math
 import os
 
 import matplotlib
@@ -128,7 +127,7 @@ class DirichletObjectMap:
         Parameters
         ----------
         detections : list[dict]
-            From sOSL_tb4Functions.visionBranch (objectType, map_x, map_y, radius).
+            From tb4_vision.detect_objects (objectType, map_x, map_y, radius).
         cam_xz : tuple
             Camera position (map x, map y).
         heading : float
@@ -141,7 +140,9 @@ class DirichletObjectMap:
         dict
             Number of object / background cells updated and skipped detections.
         """
-        obj_masks = {}
+        # Collect this frame's cells first (boolean masks), then add evidence once,
+        # so a cell gets at most one increment per class per frame.
+        obj_masks = {}                       # class index -> cells covered by objects of that class
         footprint_union = np.zeros((self.H, self.W), dtype=bool)
         corridors = np.zeros((self.H, self.W), dtype=bool)
         skipped = []
@@ -152,15 +153,19 @@ class DirichletObjectMap:
                 skipped.append(name)
                 continue
             obj_xz = (det['map_x'], det['map_y'])
+            # Footprint radius = half the metric box width, kept within [min_radius, max_radius]
             radius = float(np.clip(det.get('radius', self.min_radius), self.min_radius, self.max_radius))
             fp = self.footprint_mask(obj_xz[0], obj_xz[1], radius)
             k = self.cls_idx[name]
             obj_masks[k] = obj_masks.get(k, np.zeros_like(fp)) | fp
             footprint_union |= fp
+            # Seeing the object means the space between the camera and it is empty
             corridors |= self.corridor_mask(cam_xz, obj_xz, radius)
 
+        # Background: those corridors, limited to the field of view, never on an object footprint
         background = corridors & self.fov_mask(cam_xz, heading, hfov, max_range) & ~footprint_union
 
+        # Dirichlet evidence: +object_evidence for the detected class, +background_evidence for Background
         for k, m in obj_masks.items():
             self.beta[m, k] += self.object_evidence
         self.beta[background, self.bg_idx] += self.background_evidence
@@ -308,10 +313,3 @@ class DirichletObjectMap:
             fig.tight_layout()
             fig.savefig(os.path.join(maps_dir, f'{name}.png'), dpi=120)
             plt.close(fig)
-
-
-def camera_pose_in_map(optical_to_map):
-    """Camera (x, y) and optical-axis yaw in the map frame from an optical->map transform."""
-    origin = np.asarray(optical_to_map(np.zeros(3)), dtype=float)
-    ahead = np.asarray(optical_to_map(np.array([0.0, 0.0, 1.0])), dtype=float)
-    return (origin[0], origin[1]), math.atan2(ahead[1] - origin[1], ahead[0] - origin[0])

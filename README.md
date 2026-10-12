@@ -7,13 +7,16 @@ This is the TB4 port of the AI2-THOR `sOSL_main.py` / `fusion_controller.py` pip
 
 | File | Role |
 | --- | --- |
+| `sOSL_tb4_main.py` | **Edit this:** the experiment parameters in `main()`, then starts the run |
+| `tb4_config.py` | `ExperimentConfig`: every parameter, its default and what it does |
+| `tb4_controller.py` | The ROS node: sensors, step loop, olfactory update, saving, `navigate()` stub |
+| `tb4_vision.py` | Camera branch (`'F'` only): YOLO → objects in the map → `navKnowledge` or Dirichlet fusion |
+| `sOSL_dirichletFunctions.py` | Dirichlet object map |
+| `sOSL_tb4Functions.py` | ROS-free helpers: image decoding, camera geometry, `TB4BayesianAgent`, search grid, plots |
 | `sOSL_olfactionFunctions.py`, `sOSL_visionFunctions.py`, `sOSL_utils.py`, `sOSL_loggerFunctions.py` | Unchanged copies of the AI2-THOR code base (the package `__init__` makes their flat imports work) |
-| `sOSL_tb4Functions.py` | TB4 adapters: image decoding, depth-based 3D localisation, TB4 `visionBranch`, `TB4BayesianAgent` (plume with `q_s`, `D`, `tau`), search grid from `/map`, plots |
-| `sOSL_dirichletFunctions.py` | Dirichlet object map (second vision approach) |
-| `tb4_base_controller.py` | `ExperimentConfig` + shared node: pose, map, olfaction, logging, `navigate()` stub |
-| `tb4_olfactory_controller.py` | `'O'`: olfactory map only (no camera, no YOLO) |
-| `tb4_fusion_controller.py` | `'F'`: olfaction + vision, `vision_mode = 'navKnowledge'` or `'dirichlet'` |
-| `sOSL_tb4_main.py` | `main()`: experiment parameters |
+
+How a step flows: `tb4_controller.TB4Controller.step_callback` → `run_step` (olfaction) → `Vision.fuse` (`'F'`) →
+`navigate` → save. During the step window, `vision_callback` → `Vision.process_frame` handles each camera frame.
 
 ## Experiments (set in `main()`)
 
@@ -63,7 +66,7 @@ Before the Bayesian update, raw `/olfaction` concentrations are rescaled linearl
 
 `rescaled = 100 · (raw − min) / (max − min)`
 
-- Set `olfaction_min_conc` and `olfaction_max_conc` in `main()`. Each is a number or the path of an `olfaction_data.csv`, in which case its mean `chemicalConc` is used.
+- Set `olfaction_min_conc` and `olfaction_max_conc` in `main()`. Each is a number, or `mean_concentration('…/olfaction_data.csv')` to use the mean `chemicalConc` of a recording.
 - Values are not clipped, so readings below `min` become negative.
 - Leave both `None` to use raw readings.
 - `trajectory_log.csv` logs the window mean `raw_concentration`, its `raw_concentration_std`, the number of readings
