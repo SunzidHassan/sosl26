@@ -51,6 +51,7 @@ import pandas as pd  # noqa: E402
 from scipy.special import digamma  # noqa: E402
 
 from matplotlib.colors import ListedColormap  # noqa: E402
+from matplotlib.patches import Polygon as PolygonPatch  # noqa: E402
 
 BACKGROUND = 'Background'
 
@@ -92,7 +93,7 @@ class DirichletObjectMap:
                  background=BACKGROUND, conf_temper=1.0,
                  bg_false_neg_rate=0.15, bg_dist_decay=0.5,
                  prior_strength=1.0, min_radius=None, max_radius=1.0,
-                 class_colors=None, gt_positions=None):
+                 class_colors=None, gt_positions=None, area_mask=None, area_polygon=None):
         # class_colors: {class name: matplotlib color} (case-insensitive, incl. 'Background')
         # gt_positions: {class name: (map x, map y)} ground-truth object positions
         """
@@ -151,6 +152,10 @@ class DirichletObjectMap:
         self.class_colors = {str(k).lower(): v for k, v in (class_colors or {}).items()}
         self.gt_positions = dict(gt_positions or {})
 
+        # Search area (bool (H, W)) and its polygon: no evidence and no source probability outside.
+        self.area_mask = None if area_mask is None else np.asarray(area_mask, dtype=bool)
+        self.area_polygon = area_polygon
+
     # ------------------------------------------------------------------
     # Evidence accumulation
     # ------------------------------------------------------------------
@@ -199,11 +204,9 @@ class DirichletObjectMap:
         dict
             Number of object / background cells updated and skipped detections.
         """
-        # Collect this frame's cells first (boolean masks), then add evidence once,
-        # so a cell gets at most one increment per class per frame.
-        obj_masks = {}                       # class index -> cells covered by objects of that class
+        valid = np.ones((self.H, self.W), dtype=bool) if self.area_mask is None else self.area_mask
         footprint_union = np.zeros((self.H, self.W), dtype=bool)
-        contrib = {}   # predicted-class idx -> (H, W) max-confidence-weight map
+        contrib = {}       # predicted-class idx -> (H, W) map of the highest confidence covering each cell
         skipped = []
 
         for det in detections:
@@ -211,35 +214,33 @@ class DirichletObjectMap:
             if name not in self.cls_idx or name == self.background:
                 skipped.append(name)
                 continue
-            obj_xz = (det['map_x'], det['map_y'])
-            # Footprint radius = half the metric box width, kept within [min_radius, max_radius]
+            # (4) Footprint radius = half the metric box width, kept within [min_radius, max_radius]
             radius = float(np.clip(det.get('radius', self.min_radius), self.min_radius, self.max_radius))
-            fp = self.footprint_mask(obj_xz[0], obj_xz[1], radius)
+            fp = self.footprint_mask(det['map_x'], det['map_y'], radius) & valid
 
+            # (5) Same-class detections overlapping in this frame: keep the max confidence per
+            # cell instead of summing, so one object seen twice doesn't count twice.
             d_idx = self.cls_idx[name]
             xi = float(det['Conf']) * self.conf_temper
-
-            # (5) dedupe same-class overlapping detections in this frame:
-            # keep the max confidence per cell, don't sum contributions.
-            weight_map = contrib.get(d_idx)
-            if weight_map is None:
-                weight_map = np.zeros((self.H, self.W))
-                contrib[d_idx] = weight_map
+            weight_map = contrib.setdefault(d_idx, np.zeros((self.H, self.W)))
             np.maximum(weight_map, np.where(fp, xi, 0.0), out=weight_map)
-
             footprint_union |= fp
-            # Seeing the object means the space between the camera and it is empty
-            corridors |= self.corridor_mask(cam_xz, obj_xz, radius)
 
-        # Background: those corridors, limited to the field of view, never on an object footprint
-        background = corridors & self.fov_mask(cam_xz, heading, hfov, max_range) & ~footprint_union
+        # (1) Object evidence: beta[c] += xi * C[d, :], the likelihood of "detector said d" for
+        # every true class (so e.g. a 'Microwave' detection also adds a little Refrigerator
+        # and Background evidence, as the confusion matrix says).
+        for d_idx, weight_map in contrib.items():
+            self.beta += weight_map[:, :, None] * self.confusion_matrix[d_idx][None, None, :]
 
-        # Dirichlet evidence: +object_evidence for the detected class, +background_evidence for Background
-        for k, m in obj_masks.items():
-            self.beta[m, k] += self.object_evidence
-        self.beta[background, self.bg_idx] += self.background_evidence
-        self.observed |= footprint_union | background
+        # (3) Background evidence: every visible cell (in the field of view and depth range)
+        # that no detection covers. Weaker far away, and capped by the miss rate eta:
+        #     bg_strength = (1 - eta) / (1 + lambda * distance)
+        bg_cells = self.fov_mask(cam_xz, heading, hfov, max_range) & ~footprint_union & valid
+        dist = np.hypot(self.Xc - cam_xz[0], self.Zc - cam_xz[1])
+        bg_strength = (1.0 - self.bg_false_neg_rate) / (1.0 + self.bg_dist_decay * dist)
+        self.beta[bg_cells, self.bg_idx] += bg_strength[bg_cells]
 
+        self.observed |= footprint_union | bg_cells
         return dict(object_cells=int(footprint_union.sum()), background_cells=int(bg_cells.sum()),
                     skipped=skipped)
 
@@ -295,9 +296,12 @@ class DirichletObjectMap:
 
     def source_prob_given_vision(self):
         sem = self.semantic_likelihood_map()
+        if self.area_mask is not None:
+            sem = np.where(self.area_mask, sem, 0.0)     # the source can't be outside the search area
         total = sem.sum()
         if total < 1e-12:
-            return np.full_like(sem, 1.0 / sem.size)
+            uniform = np.ones_like(sem) if self.area_mask is None else self.area_mask.astype(float)
+            return uniform / uniform.sum()
         return sem / total
 
     def top_object_at(self, row, col):
@@ -331,6 +335,15 @@ class DirichletObjectMap:
         ax.set_xlim(xlim)
         ax.set_ylim(ylim)
 
+    def draw_area(self, ax):
+        """Dashed outline of the search area, if one is set."""
+        if self.area_polygon:
+            xlim, ylim = ax.get_xlim(), ax.get_ylim()
+            ax.add_patch(PolygonPatch(self.area_polygon, closed=True, fill=False, edgecolor='black',
+                                      linestyle='--', linewidth=1.2, zorder=5))
+            ax.set_xlim(xlim)
+            ax.set_ylim(ylim)
+
     def _extent(self):
         h = self.res / 2.0
         return [self.x_points[0] - h, self.x_points[-1] + h, self.z_points[0] - h, self.z_points[-1] + h]
@@ -351,6 +364,7 @@ class DirichletObjectMap:
             cb = fig.colorbar(im, ax=ax, ticks=range(len(present)))
             cb.ax.set_yticklabels([self.classes[k] for k in present])
         self.overlay_ground_truth(ax)
+        self.draw_area(ax)
         if robot_xz is not None:
             ax.plot(robot_xz[0], robot_xz[1], marker='o', ms=8, mfc='lime', mec='black', ls='', zorder=8)
         ax.set_title(title)

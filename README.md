@@ -21,12 +21,18 @@ How a step flows: `tb4_controller.TB4Controller.step_callback` → `run_step` (o
 ## Experiments (set in `main()`)
 
 - `alg_choice = 'O'`: olfactory-only. Each step saves the Bayesian map. The estimate is its arg-max cell.
-- `alg_choice = 'F'`: fusion. Builds a per-cell Dirichlet class distribution over the YOLO classes plus Background.
+- `alg_choice = 'F'`: fusion with the fine-tuned YOLO (`yolo_model_path`, 5 classes: Cardboard box, Garbage can,
+  Microwave, Refrigerator, Toaster). It builds a per-cell Dirichlet distribution over those classes plus Background.
   - It starts from a uniform prior (`prior_strength / K`).
-  - Each detection adds +1 to its class over a footprint of radius half the metric bbox width (`bbox_w_px * depth / fx / 2`).
-  - Cells between the camera and each detection, inside the FOV and map bounds, get +0.5 Background.
-  - Then `P(src | V) ∝ Σ_k p(o_k | z) · max(0, sim(class_k, goal))` (Background similarity 0), and the fused map is
-    `P(src | C) · P(src | V)` normalised. The estimate is the fused arg-max.
+  - A detection of class `d` with confidence `xi` adds `xi · C[d, :]` over its footprint. `C` is the normalized YOLO
+    confusion matrix (`dirichlet_conf_labels` / `dirichlet_conf_matrix` in `main()`), and the footprint radius is half
+    the metric bbox width. Overlapping same-class detections in one frame count once (max confidence).
+  - Every other visible cell (field of view, depth range) gets Background evidence
+    `(1 − eta) / (1 + lambda · distance)`, in every frame, even frames without detections.
+  - `P(src | V) ∝ Σ_k p(o_k | z) · max(0, sim(class_k, goal))`, with Background similarity 0. The fused map is
+    `P(src | C) · P(src | V)`, normalised, and the estimate is its arg-max.
+- **Search area:** `search_area` (polygon corners) restricts everything. Cells outside get probability 0 in the
+  olfactory, visual and fused maps and receive no object-map evidence. The polygon is drawn as a dashed line on the maps.
 
 ## Build and run
 
@@ -48,8 +54,8 @@ Each step is a window of `sample_period` seconds (`n`, default 5 s). Stop the ro
 - **Olfaction:** every `/olfaction` message in the window (`Vector3`: x = wind direction, y = wind speed, z = concentration)
   is averaged. The Bayesian map is updated once per step with that mean, at the pose at the end of the window.
 - **Vision (`'F'`):** YOLO runs on every new frame, at most one per `vision_period` (default 0.5 s), throughout the window.
-  Each frame is projected with the pose at that moment and adds its own evidence to the object map (+1 per detection
-  footprint, +0.5 per background cell). A 5 s window therefore adds up to about 10 evidence per object.
+  Each frame is projected with the pose at that moment and adds its own evidence to the object map, so a 5 s window adds
+  up to about 10 frames of evidence.
 - **End of the step:** maps are fused and saved, and `navigate()` is called. `navigate()` does nothing yet, and the node
   never publishes `/cmd_vel`, so teleop keeps control.
 

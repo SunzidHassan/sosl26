@@ -9,9 +9,10 @@ How the controller (tb4_controller.py) uses it:
                    combines it with the olfactory map and picks the source estimate.
 
 Object map (sOSL_dirichletFunctions.py): every grid cell holds a Dirichlet
-distribution over the YOLO classes + Background. Per frame, a detected object adds
-+1 to its class in its footprint, and the empty space the camera saw between
-itself and the object adds +0.5 to Background. Then
+distribution over the YOLO classes + Background. Per frame, a detection of class d
+with confidence xi adds xi * C[d, :] (its row of the YOLO confusion matrix) in its
+footprint, and every other visible cell in the field of view gets Background
+evidence that weakens with distance. Then
 
     P(src | V)[cell] = sum_k p(class_k | cell) * similarity(class_k, goal phrase)
     fused            = P(src | olfaction) * P(src | V), normalised
@@ -29,7 +30,7 @@ import cv2
 import numpy as np
 import pandas as pd
 
-from sOSL_dirichletFunctions import DirichletObjectMap
+from sOSL_dirichletFunctions import DirichletObjectMap, confusion_matrix_from_normalized
 from sOSL_tb4Functions import (boxDepth, camera_pose_in_map, format_position, grid_to_world,
                                map_entropy, pixel_to_optical)
 
@@ -146,14 +147,26 @@ class Vision:
         """Creates the object map once the search grid is known."""
         cfg = self.cfg
         self.grid = grid
+        classes = self.object_classes()
+        # Confusion matrix reordered to the map's class order (objects, then Background),
+        # columns renormalised; checks that its labels match the model's classes.
+        conf = confusion_matrix_from_normalized(classes, cfg.dirichlet_conf_matrix, cfg.dirichlet_conf_labels,
+                                                bg_fp_rate=cfg.dirichlet_bg_fp_rate)
         self.object_map = DirichletObjectMap(
-            grid.x_points, grid.z_points, self.object_classes(),
-            object_evidence=cfg.dirichlet_object_evidence,
-            background_evidence=cfg.dirichlet_background_evidence,
+            grid.x_points, grid.z_points, classes, conf,
+            conf_temper=cfg.dirichlet_conf_temper,
+            bg_false_neg_rate=cfg.dirichlet_bg_false_neg_rate,
+            bg_dist_decay=cfg.dirichlet_bg_dist_decay,
             prior_strength=cfg.dirichlet_prior_strength,
             min_radius=cfg.dirichlet_min_radius,
             max_radius=cfg.dirichlet_max_radius,
+            class_colors=cfg.class_colors,
+            gt_positions=cfg.object_positions,
+            area_mask=grid.area_mask,
+            area_polygon=grid.area_polygon,
         )
+        self.log.info("Confusion matrix C[pred][true] in class order "
+                      f"{self.object_map.classes}:\n{np.array2string(conf, precision=3)}")
         # How related each class name is to the goal phrase; computed once per run
         table = self.object_map.set_class_similarity(
             self.sentence_model, self.goal_phrase, background_similarity=cfg.dirichlet_background_similarity)
@@ -189,8 +202,8 @@ class Vision:
             exclude_names=cfg.yolo_exclude_classes, depth_percentile=cfg.depth_percentile,
             depth_range=cfg.depth_range, logger=self.log.debug)
 
-        # Each frame is one more observation: objects add evidence in their footprint,
-        # the empty space the camera saw in front of them adds Background evidence.
+        # Each frame is one more observation: detections add confusion-matrix evidence in their
+        # footprint, every other visible cell adds Background evidence.
         cam_xy, heading = camera_pose_in_map(optical_to_map)
         hfov = 2.0 * math.atan(rgb.shape[1] / (2.0 * K[0]))
         self.object_map.update(detections, cam_xy, heading, hfov, max_range=cfg.depth_range[1])

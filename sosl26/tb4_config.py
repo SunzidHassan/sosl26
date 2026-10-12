@@ -9,7 +9,7 @@ functions call map y "z" (see sOSL_tb4Functions.py).
 """
 
 from dataclasses import dataclass, field
-from typing import Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -62,10 +62,14 @@ class ExperimentConfig:
     map_wait_timeout: float = 10.0       # seconds to wait for /map before falling back to ...
     fallback_map_size: float = 10.0      # ... a square of this size (m) around the start pose
     source_position: Optional[Tuple[float, float]] = None  # true source (x, y) if known; only used for evaluation
+    # Search area: polygon corners [(x, y), ...] in order. Cells outside get probability 0 in the
+    # olfactory, visual and fused maps, and receive no object-map evidence. None = whole grid.
+    search_area: Optional[List[Tuple[float, float]]] = None
 
     # ------------------------------------------------------------------
     # Vision ('F' only)
     # ------------------------------------------------------------------
+    yolo_model_path: str = "yolo26m.pt"  # relative paths are relative to the sosl26 package folder
     yolo_conf: float = 0.3               # minimum YOLO confidence
     yolo_target_classes: Optional[Sequence[str]] = None  # only keep these classes (None = all model classes)
     yolo_exclude_classes: Sequence[str] = field(default_factory=list)  # always drop these classes
@@ -76,12 +80,24 @@ class ExperimentConfig:
     save_vision_frames: bool = True      # save the annotated YOLO image of every processed frame
 
     # Dirichlet object map, see sOSL_dirichletFunctions.py
-    dirichlet_object_evidence: float = 1.0      # added to an object's class, per frame, in its footprint cells
-    dirichlet_background_evidence: float = 0.5  # added to Background, per frame, in empty cells camera -> object
+    # Normalized YOLO confusion matrix (Ultralytics layout): rows = predicted, columns = true class,
+    # both in dirichlet_conf_labels order; the label 'background' is the "no object" class.
+    # Its labels must be exactly the model's classes (after yolo_target/exclude_classes) + 'background'.
+    dirichlet_conf_labels: Optional[List[str]] = None
+    dirichlet_conf_matrix: Optional[List[List[float]]] = None
+    dirichlet_bg_fp_rate: float = 0.05          # chance that empty space produces any false detection
+    dirichlet_conf_temper: float = 1.0          # evidence per detection = confidence * conf_temper (<1 for
+                                                # correlated consecutive frames)
+    dirichlet_bg_false_neg_rate: float = 0.15   # eta: chance YOLO misses a visible object; background evidence
+                                                # per frame = (1 - eta) / (1 + bg_dist_decay * distance)
+    dirichlet_bg_dist_decay: float = 0.5        # lambda: weaker background evidence far from the camera (1/m)
     dirichlet_prior_strength: float = 1.0       # uniform prior: each class starts at prior_strength / K
     dirichlet_min_radius: Optional[float] = None  # footprint radius limits (m); None = half a grid cell
     dirichlet_max_radius: float = 1.0
     dirichlet_background_similarity: float = 0.0  # similarity of Background to the goal (empty space has no odor)
+    object_positions: Optional[Dict[str, Tuple[float, float]]] = None  # true object (x, y), drawn as stars on
+                                                                        # the object maps (evaluation only)
+    class_colors: Optional[Dict[str, str]] = None  # {class name: matplotlib color} for the object maps
 
     # ------------------------------------------------------------------
     # ROS topics and frames
@@ -108,6 +124,10 @@ class ExperimentConfig:
             raise ValueError("Set both olfaction_min_conc and olfaction_max_conc, or neither.")
         if self.olfaction_min_conc is not None and self.olfaction_max_conc == self.olfaction_min_conc:
             raise ValueError("olfaction_max_conc must differ from olfaction_min_conc.")
+        if self.alg_choice == 'F' and (self.dirichlet_conf_labels is None or self.dirichlet_conf_matrix is None):
+            raise ValueError("Fusion needs dirichlet_conf_labels and dirichlet_conf_matrix.")
+        if self.search_area is not None and len(self.search_area) < 3:
+            raise ValueError("search_area needs at least 3 corners.")
 
 
 def mean_concentration(csv_path):

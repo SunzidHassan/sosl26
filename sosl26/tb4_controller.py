@@ -278,15 +278,21 @@ class TB4Controller(Node):
             self.get_logger().info(f"Waiting for {cfg.map_topic}...", throttle_duration_sec=2.0)
             return False
 
-        # Bayesian map over the grid, starting uniform (the robot's start pose needs no config)
+        # Restrict the search to the configured polygon (cells outside get probability 0)
         g = self.grid
+        g.set_search_area(cfg.search_area)
+        if not g.area_mask.any():
+            raise ValueError(f"search_area {cfg.search_area} contains no grid cell centre "
+                             f"(grid x {g.x_points[0]}..{g.x_points[-1]}, y {g.z_points[0]}..{g.z_points[-1]})")
+
+        # Bayesian map over the grid, uniform over the search area (the start pose needs no config)
         src_cell = (world_to_grid(cfg.source_position[0], cfg.source_position[1], g.x_points, g.z_points)
                     if cfg.source_position is not None else None)
         self.bayesian_agent = TB4BayesianAgent(
             pos=world_to_grid(pose[0], pose[1], g.x_points, g.z_points), src_pos=src_cell,
             x_points=g.x_points, z_points=g.z_points, sigma_noise=cfg.sigma_noise,
             reachable_positions=g.reachable_positions,
-            q_s=cfg.q_s, D=cfg.D, tau=cfg.tau, U=cfg.U, psi_deg=cfg.psi_deg)
+            q_s=cfg.q_s, D=cfg.D, tau=cfg.tau, U=cfg.U, psi_deg=cfg.psi_deg, area_mask=g.area_mask)
 
         # Entropy of the uniform map is the maximum; the behaviour flag switches at entropy_frac of it
         H_max = map_entropy(self.bayesian_agent.prob_map)
@@ -297,7 +303,8 @@ class TB4Controller(Node):
 
         self.get_logger().info(
             f"Search grid from {grid_src}: x [{g.x_points[0]:.2f}, {g.x_points[-1]:.2f}], "
-            f"y [{g.z_points[0]:.2f}, {g.z_points[-1]:.2f}], {len(g.z_points)}x{len(g.x_points)} cells. "
+            f"y [{g.z_points[0]:.2f}, {g.z_points[-1]:.2f}], {len(g.z_points)}x{len(g.x_points)} cells, "
+            f"{int(g.area_mask.sum())} inside the search area. "
             f"Start pose ({pose[0]:.2f}, {pose[1]:.2f}). H_max {H_max:.2f} bits, "
             f"threshold {self.entropy_threshold:.2f} bits ({cfg.entropy_frac * 100:.0f}%).")
 
@@ -311,6 +318,8 @@ class TB4Controller(Node):
             "grid_bounds": list(map(float, g.bounds)),
             "x_points": g.x_points.tolist(),
             "z_points(map_y)": g.z_points.tolist(),
+            "search_area": g.area_polygon,
+            "search_area_cells": int(g.area_mask.sum()),
             "H_max": float(H_max),
             "entropy_threshold": float(self.entropy_threshold),
             **(self.vision.run_info() if self.vision is not None else {}),
@@ -447,7 +456,9 @@ class TB4Controller(Node):
         tag = f"{step:03d}_x_{robot_x:.2f}_z_{robot_z:.2f}"
         panels = [(srcProbGivenOlfactory, rf'$H_C={olfactoryEntropy:.2f}$')] + estimate.panels
         try:
-            save_belief_maps(panels, g.x_points, g.z_points, os.path.join(self.save_dir, f"maps_all_{tag}.png"))
+            trajectory = [(r["robot_x"], r["robot_z"]) for r in self.trajectory_log_list] + [(robot_x, robot_z)]
+            save_belief_maps(panels, g.x_points, g.z_points, os.path.join(self.save_dir, f"maps_all_{tag}.png"),
+                             trajectory=trajectory, outline=g.area_polygon)
         except Exception as e:
             self.get_logger().error(f"Error saving belief map plot at step {step}: {e}")
         np.savez_compressed(os.path.join(self.save_dir, f"maps_{step:03d}.npz"), olfactory=srcProbGivenOlfactory,

@@ -19,20 +19,6 @@ import rclpy
 from sosl26.tb4_config import ExperimentConfig, mean_concentration  # noqa: F401 (mean_concentration: see below)
 from sosl26.tb4_controller import TB4Controller, spin_with_ui
 
-# Every class of the pretrained COCO model except microwave, toaster and refrigerator
-COCO_EXCLUDE = [
-    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light",
-    "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
-    "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
-    "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard",
-    "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
-    "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch",
-    "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard",
-    "cell phone", "oven", "sink", "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush",
-]
-
-YOLO_MODEL_PATH = "yolo26m.pt"   # pretrained YOLO26m (ultralytics downloads it on first use)
-
 
 def main(args=None):
     # ===================== Experiment =====================
@@ -62,13 +48,31 @@ def main(args=None):
         # Map / evaluation (ROS map frame)
         map_bounds=None,                 # (x_min, x_max, y_min, y_max); None = use /map
         source_position=None,            # true source (x, y) if known
+        search_area=[                    # corners (x, y) in order; probability is 0 outside
+            (-7.5, -6.4),                # South East corner
+            (-6.0, -1.0),                # Middle East
+            (-3.0, -1.0),                # Center
+            (0.0, -3.0),                 # North East
+            (0.0, 0.0),                  # North West
+            (-7.5, -0.7),                # South West
+        ],
 
-        # Vision
+        # Vision: fine-tuned YOLO26m (5 lab objects); path relative to the sosl26 package folder
+        yolo_model_path="models/YOLO/neth234YOLO26m100epoch.pt",
         yolo_conf=0.3,
-        yolo_exclude_classes=COCO_EXCLUDE,
-        dirichlet_object_evidence=1.0,      # per frame, per object footprint cell
-        dirichlet_background_evidence=0.5,  # per frame, per empty cell between camera and object
-        dirichlet_max_radius=5.0,           # footprint radius limit (m); radius = half the metric box width
+
+        # Dirichlet object map: normalized confusion matrix of the model above
+        # (rows = predicted, columns = true, both in dirichlet_conf_labels order)
+        dirichlet_conf_labels=['Cardboard box', 'Garbage can', 'Microwave', 'Refrigerator', 'Toaster', 'background'],
+        dirichlet_conf_matrix=[
+            [0.91, 0.00, 0.00, 0.00, 0.00, 0.12],   # pred Cardboard box
+            [0.00, 1.00, 0.00, 0.00, 0.00, 0.10],   # pred Garbage can
+            [0.04, 0.00, 1.00, 0.05, 0.00, 0.41],   # pred Microwave
+            [0.00, 0.00, 0.00, 0.85, 0.04, 0.14],   # pred Refrigerator
+            [0.00, 0.00, 0.00, 0.00, 0.96, 0.23],   # pred Toaster
+            [0.04, 0.00, 0.00, 0.10, 0.00, 0.00],   # pred background (missed)
+        ],
+        dirichlet_max_radius=5.0,        # footprint radius limit (m); radius = half the metric box width
     )
     # ======================================================
 
@@ -80,11 +84,25 @@ def main(args=None):
     yolo_model = None
     if cfg.alg_choice == 'F':
         from ultralytics import YOLO      # only fusion runs need YOLO
-        yolo_model = YOLO(YOLO_MODEL_PATH)
+        yolo_model = YOLO(package_path(cfg.yolo_model_path))
+        print(f"YOLO classes: {yolo_model.names}")
 
     rclpy.init(args=args)
     spin_with_ui(TB4Controller(cfg, save_dir, yolo_model))
     print(f"--- COMPLETED TB4 RUN {run_serial} ---")
+
+
+def package_root():
+    """The sosl26 source folder (contains package.xml) when running from the source tree, else the cwd."""
+    root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    return root if os.path.isfile(os.path.join(root, "package.xml")) else os.getcwd()
+
+
+def package_path(path):
+    """Absolute paths and paths that exist from the cwd are kept; others are taken relative to package_root()."""
+    if os.path.isabs(path) or os.path.exists(path):
+        return path
+    return os.path.join(package_root(), path)
 
 
 def make_run_dir(cfg):
@@ -93,9 +111,7 @@ def make_run_dir(cfg):
     `save` is in the sosl26 source folder when running from the source tree
     (colcon build --symlink-install), otherwise in the current directory.
     """
-    pkg_root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-    save_root = os.path.join(pkg_root if os.path.isfile(os.path.join(pkg_root, "package.xml")) else os.getcwd(),
-                             "save")
+    save_root = os.path.join(package_root(), "save")
 
     odor_tag = re.sub(r"[^A-Za-z0-9]+", "", cfg.odor.title())        # "burnt" -> "Burnt"
     alg_folder = f"save_{cfg.alg_choice}_{odor_tag}"

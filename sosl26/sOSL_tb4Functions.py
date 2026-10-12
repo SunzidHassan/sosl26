@@ -12,7 +12,7 @@ Sections
   Image decoding         CompressedImage / compressedDepth -> numpy arrays
   Camera model           intrinsics, box depth, pixel -> optical frame -> map frame
   Olfaction              TB4BayesianAgent: BayesianAgent with configurable plume parameters
-  Search grid            grid cells + reachable mask from /map (or fixed bounds)
+  Search grid            grid cells + reachable mask from /map (or fixed bounds), search-area polygon
   Maps + plots           belief-map figure, trajectory plot
 
 Coordinate convention
@@ -53,7 +53,8 @@ import matplotlib.colors as mcolors  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
-from matplotlib.patches import Circle  # noqa: E402
+from matplotlib.patches import Circle, Polygon as PolygonPatch  # noqa: E402
+from matplotlib.path import Path  # noqa: E402
 from mpl_toolkits.axes_grid1 import make_axes_locatable  # noqa: E402
 from scipy.spatial.transform import Rotation  # noqa: E402
 
@@ -361,9 +362,18 @@ class TB4BayesianAgent(BayesianAgent):
     """
 
     def __init__(self, pos, src_pos, x_points, z_points, sigma_noise,
-                 reachable_positions, q_s=2000, D=10, tau=1000, U=0, psi_deg=0):
+                 reachable_positions, q_s=2000, D=10, tau=1000, U=0, psi_deg=0, area_mask=None):
         super().__init__(pos, src_pos, x_points, z_points, sigma_noise, reachable_positions)
         self.plume_params = dict(q_s=q_s, D=D, U=U, tau=tau, psi_deg=psi_deg)
+        # Cells where the source may be (True); cells outside the search area start at 0
+        # and stay 0, because the update only multiplies.
+        self.area_mask = (np.ones_like(self.prob_map, dtype=bool) if area_mask is None
+                          else np.asarray(area_mask, dtype=bool))
+        self.prob_map = self.uniform_prior()
+
+    def uniform_prior(self):
+        """Uniform over the search area, 0 outside."""
+        return self.area_mask / self.area_mask.sum()
 
     def expected_concentration(self, x, z, source):
         return gaussian_plume(x, z, source, **self.plume_params)
@@ -390,7 +400,7 @@ class TB4BayesianAgent(BayesianAgent):
         else:
             # Every cell was ruled out (readings inconsistent with the model): restart from uniform
             print("Warning: Probability map sum is close to zero after update.")
-            self.prob_map = np.full((self.window_z, self.window_x), 1.0 / (self.window_z * self.window_x))
+            self.prob_map = self.uniform_prior()
 
 
 # ==========================
@@ -406,6 +416,27 @@ class SearchGrid:
     bounds: tuple                      # (min_x, max_x, min_z, max_z) of the mask
     mask: np.ndarray                   # bool (H, W), True = free, row 0 at min_z
     reachable_positions: list = field(default_factory=list)  # [(x, z), ...]
+    area_mask: np.ndarray = None       # bool (len(z_points), len(x_points)): grid cells inside the search area
+    area_polygon: list = None          # [(x, y), ...] corners of the search area, or None = whole grid
+
+    def set_search_area(self, polygon):
+        """Restricts the search to a polygon: cells whose centre is outside get probability 0."""
+        self.area_polygon = [tuple(map(float, p)) for p in polygon] if polygon else None
+        self.area_mask = polygon_mask(self.x_points, self.z_points, self.area_polygon)
+
+
+def polygon_mask(x_points, z_points, polygon):
+    """Boolean grid (rows = z_points, cols = x_points): True for cell centres inside `polygon`
+    (or on its edge). polygon = [(x, y), ...] corners in order; None = every cell."""
+    if not polygon:
+        return np.ones((len(z_points), len(x_points)), dtype=bool)
+    X, Z = np.meshgrid(x_points, z_points)
+    centres = np.column_stack([X.ravel(), Z.ravel()])
+    path = Path(polygon)
+    # contains_points' radius grows or shrinks the polygon depending on its orientation,
+    # so test both signs to include cells lying exactly on an edge.
+    inside = path.contains_points(centres, radius=1e-6) | path.contains_points(centres, radius=-1e-6)
+    return inside.reshape(X.shape)
 
 
 def _grid_points(lo, hi, step):
@@ -421,7 +452,9 @@ def grid_from_bounds(x_min, x_max, z_min, z_max, step=0.25):
     z_points = _grid_points(z_min, z_max, step)
     mask = np.ones((len(z_points), len(x_points)), dtype=bool)
     reachable = [(float(x), float(z)) for z in z_points for x in x_points]
-    return SearchGrid(x_points, z_points, (x_min, x_max, z_min, z_max), mask, reachable)
+    grid = SearchGrid(x_points, z_points, (x_min, x_max, z_min, z_max), mask, reachable)
+    grid.set_search_area(None)
+    return grid
 
 
 def grid_from_occupancy(occ, resolution, origin_x, origin_y, step=0.25,
@@ -470,7 +503,9 @@ def grid_from_occupancy(occ, resolution, origin_x, origin_y, step=0.25,
             if 0 <= r < free.shape[0] and 0 <= c < free.shape[1] and free[r, c]:
                 reachable.append((float(x), float(z)))
 
-    return SearchGrid(x_points, z_points, (min_x, max_x, min_z, max_z), free, reachable)
+    grid = SearchGrid(x_points, z_points, (min_x, max_x, min_z, max_z), free, reachable)
+    grid.set_search_area(None)
+    return grid
 
 
 # ==========================
@@ -484,7 +519,14 @@ def _minmax(m):
     return (m - lo) / (hi - lo) if hi - lo > 1e-12 else np.zeros_like(m)
 
 
-def save_belief_maps(panels, x_points, z_points, out_fname, trajectory=None):
+def draw_outline(ax, polygon, **kw):
+    """Draws the search-area polygon (if any) on a map axis."""
+    if polygon:
+        ax.add_patch(PolygonPatch(polygon, closed=True, fill=False, edgecolor=kw.get('color', 'cyan'),
+                                  linestyle='--', linewidth=1.2, zorder=kw.get('zorder', 3)))
+
+
+def save_belief_maps(panels, x_points, z_points, out_fname, trajectory=None, outline=None):
     """Saves a row of belief maps, e.g. olfactory / visual / fused.
 
     Same rendering as the belief map block in fusion_controller.py (each map
@@ -494,6 +536,10 @@ def save_belief_maps(panels, x_points, z_points, out_fname, trajectory=None):
     ----------
     panels : list[tuple[np.ndarray, str]]
         (map, title) pairs; one panel for olfactory-only runs, three for fusion.
+    trajectory : list[(x, y)], optional
+        Robot positions so far, drawn on every panel (start lime, current cyan).
+    outline : list[(x, y)], optional
+        Search-area polygon, drawn as a dashed line.
     """
     n = len(panels)
     fig, axes = plt.subplots(1, n, figsize=(4 * n, 5), sharex=True, sharey=True, squeeze=False)
@@ -510,6 +556,7 @@ def save_belief_maps(panels, x_points, z_points, out_fname, trajectory=None):
         ax.set_xlim(xmin, xmax)
         ax.set_ylim(zmin, zmax)
         ax.set_aspect('equal', adjustable='box')
+        draw_outline(ax, outline)
         if trajectory is not None and len(trajectory) > 0:
             tx, tz = zip(*trajectory)
             ax.plot(tx, tz, '-', color='cyan', linewidth=1.5, zorder=4)
@@ -559,6 +606,7 @@ def plot_tb4_trajectory(trajectory_log_path, grid, save_path, source_xz=None,
     ov = np.tile(grey, (grid.mask.shape[0], grid.mask.shape[1], 1))
     ov[..., 3] = (~grid.mask).astype(float)
     ax.imshow(ov, extent=[min_x, max_x, min_z, max_z], origin='lower', zorder=2, alpha=0.5, aspect='auto')
+    draw_outline(ax, grid.area_polygon, color='black')
 
     if not df.empty and {'robot_x', 'robot_z'}.issubset(df.columns):
         ax.plot(df.robot_x, df.robot_z, color='purple', linewidth=1.5, zorder=4)
