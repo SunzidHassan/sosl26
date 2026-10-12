@@ -7,21 +7,26 @@ evidence beta[c]. The posterior class distribution is
 
 Changes with respect to the confusion-matrix sample (psgsl_dirichlet_map.py):
 
-1. No confusion matrix: every detection adds `object_evidence` (1.0) to its
-   class in the cells of its footprint, and every observed-empty cell adds
-   `background_evidence` (0.5) to Background.
+1. Confusion-matrix evidence: every detection adds `xi * CONF[d]` to its
+   cells' footprint, where `xi = confidence * conf_temper` and CONF[d] is
+   the predicted class's full likelihood row over true classes (object
+   classes AND Background) -- not a flat per-class indicator.
 2. Uniform prior: beta starts at prior_strength / K for every class
    (objects and Background alike).
-3. Active background: for every detection, the cells between the camera and
-   the object (a corridor as wide as the object, inside the current field of
-   view and the map bounds, stopping at the object's footprint) are observed
-   free space -> Background evidence.
+3. Active, FOV-wide background: every frame (including frames with zero
+   detections), every visible occupied cell that isn't inside a detected
+   object's footprint receives Background evidence, decayed by distance
+   from the camera and capped by an assumed detector false-negative rate:
+       bg_strength = (1 - eta) / (1 + lambda * dist)
 4. Dynamic footprint: the footprint radius of each detection is half its
-   metric bounding box width (bbox width in px * depth / fx / 2), clipped to
-   [min_radius, max_radius], instead of a fixed FOOTPRINT_RADIUS.
-
-Each cell is updated at most once per class per frame, so overlapping
-detections / corridors in one frame don't double count.
+   metric bounding box width (bbox width in px * depth / fx / 2), clipped
+   to [min_radius, max_radius], instead of a fixed FOOTPRINT_RADIUS.
+5. Overlap handling: within one frame, detections of the SAME predicted
+   class that overlap in cells are deduplicated by taking the max
+   confidence per cell (not summed) before the confusion-matrix row is
+   applied, so repeated/duplicate detections of one object don't inflate
+   evidence. Detections of DIFFERENT predicted classes still contribute
+   independently in shared cells.
 
 Source probability given vision:
 
@@ -45,14 +50,71 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 from scipy.special import digamma  # noqa: E402
 
+from matplotlib.colors import ListedColormap  # noqa: E402
+
 BACKGROUND = 'Background'
 
+def confusion_matrix_from_normalized(classes, matrix, labels, bg_fp_rate=0.05,
+                                     background=BACKGROUND, bg_label='background'):
+    """C[pred][true] (columns sum to 1) in DirichletObjectMap.classes order
+    (objects in the given order, Background last) from an Ultralytics
+    *normalized* confusion matrix (rows = predicted, columns = true, both in `labels` order).
+
+    Object columns are P(pred | true object), including the miss row (-> Background), and are
+    re-normalized for rounding. The background column of the Ultralytics matrix is the share of
+    false positives per class (it sums to 1), not a rate, so it is scaled by `bg_fp_rate`
+    (probability that a background region yields any false detection).
+    """
+    M = np.asarray(matrix, dtype=float)
+    labels = list(labels)
+    if M.shape != (len(labels), len(labels)):
+        raise ValueError(f"matrix shape {M.shape} does not match {len(labels)} labels")
+    objs = [c for c in classes if c != background]
+    if set(objs) != set(labels) - {bg_label}:
+        raise ValueError(f"model classes {sorted(objs)} != matrix classes {sorted(set(labels) - {bg_label})}; "
+                         f"fix the matrix labels or yolo_exclude_classes")
+    order = [labels.index(c) for c in objs] + [labels.index(bg_label)]
+    C = M[np.ix_(order, order)].copy()
+    n = len(objs)
+
+    share = C[:n, n]
+    share = share / share.sum() if share.sum() > 0 else np.full(n, 1.0 / n)
+    C[:n, n] = bg_fp_rate * share
+    C[n, n] = 1.0 - bg_fp_rate
+
+    for j in range(n):                      # rounding: 0.91 + 0.04 + 0.04 = 0.99
+        C[:, j] /= C[:, j].sum()
+    return C
 
 class DirichletObjectMap:
 
-    def __init__(self, x_points, z_points, classes, background=BACKGROUND,
-                 object_evidence=1.0, background_evidence=0.5, prior_strength=1.0,
-                 min_radius=None, max_radius=1.0):
+    def __init__(self, x_points, z_points, classes, confusion_matrix,
+                 background=BACKGROUND, conf_temper=1.0,
+                 bg_false_neg_rate=0.15, bg_dist_decay=0.5,
+                 prior_strength=1.0, min_radius=None, max_radius=1.0,
+                 class_colors=None, gt_positions=None):
+        # class_colors: {class name: matplotlib color} (case-insensitive, incl. 'Background')
+        # gt_positions: {class name: (map x, map y)} ground-truth object positions
+        """
+        Parameters
+        ----------
+        confusion_matrix : (K, K) array
+            C[pred][true] = p(detector predicts `pred` | object truly `true`).
+            Row/column order MUST match `self.classes` (object classes in the
+            order given, with `background` moved to the last index) -- same
+            convention as CONF in psgsl_dirichlet_map.py. Columns must sum to 1.
+        conf_temper : float
+            Scales detection confidence before it's used as evidence weight
+            (xi = confidence * conf_temper). <1.0 down-weights evidence, e.g.
+            to account for correlated consecutive frames.
+        bg_false_neg_rate : float
+            eta: assumed probability the detector misses a real object that
+            is actually in view. Caps how strongly "no detection" counts as
+            background evidence (lower eta -> stronger background evidence).
+        bg_dist_decay : float
+            lambda: how fast background evidence falls off with distance
+            from the camera. 0 = no decay.
+        """
         self.x_points = np.asarray(x_points, dtype=float)
         self.z_points = np.asarray(z_points, dtype=float)
         self.classes = [c for c in classes if c != background] + [background]
@@ -62,9 +124,18 @@ class DirichletObjectMap:
         self.K = len(self.classes)
         self.H, self.W = len(self.z_points), len(self.x_points)
 
+        self.confusion_matrix = np.asarray(confusion_matrix, dtype=float)
+        if self.confusion_matrix.shape != (self.K, self.K):
+            raise ValueError(
+                f"confusion_matrix shape {self.confusion_matrix.shape} must be "
+                f"({self.K}, {self.K}) matching self.classes order {self.classes}")
+        if not np.allclose(self.confusion_matrix.sum(axis=0), 1.0, atol=1e-6):
+            raise ValueError("confusion_matrix columns must sum to 1")
+
         self.res = float(self.x_points[1] - self.x_points[0]) if self.W > 1 else 0.25
-        self.object_evidence = object_evidence
-        self.background_evidence = background_evidence
+        self.conf_temper = conf_temper
+        self.bg_false_neg_rate = bg_false_neg_rate
+        self.bg_dist_decay = bg_dist_decay
         self.min_radius = self.res / 2.0 if min_radius is None else min_radius
         self.max_radius = max_radius
 
@@ -76,6 +147,9 @@ class DirichletObjectMap:
         self.Xc, self.Zc = np.meshgrid(self.x_points, self.z_points)   # cell centres, (H, W)
         self.class_weights = None
         self.similarity_table = None
+
+        self.class_colors = {str(k).lower(): v for k, v in (class_colors or {}).items()}
+        self.gt_positions = dict(gt_positions or {})
 
     # ------------------------------------------------------------------
     # Evidence accumulation
@@ -106,21 +180,6 @@ class DirichletObjectMap:
             mask &= np.hypot(dx, dz) <= max_range
         return mask
 
-    def corridor_mask(self, cam_xz, obj_xz, radius):
-        """(3) Cells between the camera and the object: within `radius` of the
-        camera -> object segment and before the object's footprint."""
-        cam = np.asarray(cam_xz, dtype=float)
-        vec = np.asarray(obj_xz, dtype=float) - cam
-        length = float(np.hypot(*vec))
-        if length < 1e-6:
-            return np.zeros((self.H, self.W), dtype=bool)
-        u = vec / length
-        dx, dz = self.Xc - cam[0], self.Zc - cam[1]
-        along = dx * u[0] + dz * u[1]
-        perp = np.abs(dx * u[1] - dz * u[0])
-        half_width = max(radius, self.res / 2.0)
-        return (along >= 0.0) & (along <= length - radius) & (perp <= half_width)
-
     def update(self, detections, cam_xz, heading, hfov, max_range=None):
         """Adds one frame of evidence.
 
@@ -144,7 +203,7 @@ class DirichletObjectMap:
         # so a cell gets at most one increment per class per frame.
         obj_masks = {}                       # class index -> cells covered by objects of that class
         footprint_union = np.zeros((self.H, self.W), dtype=bool)
-        corridors = np.zeros((self.H, self.W), dtype=bool)
+        contrib = {}   # predicted-class idx -> (H, W) max-confidence-weight map
         skipped = []
 
         for det in detections:
@@ -156,8 +215,18 @@ class DirichletObjectMap:
             # Footprint radius = half the metric box width, kept within [min_radius, max_radius]
             radius = float(np.clip(det.get('radius', self.min_radius), self.min_radius, self.max_radius))
             fp = self.footprint_mask(obj_xz[0], obj_xz[1], radius)
-            k = self.cls_idx[name]
-            obj_masks[k] = obj_masks.get(k, np.zeros_like(fp)) | fp
+
+            d_idx = self.cls_idx[name]
+            xi = float(det['Conf']) * self.conf_temper
+
+            # (5) dedupe same-class overlapping detections in this frame:
+            # keep the max confidence per cell, don't sum contributions.
+            weight_map = contrib.get(d_idx)
+            if weight_map is None:
+                weight_map = np.zeros((self.H, self.W))
+                contrib[d_idx] = weight_map
+            np.maximum(weight_map, np.where(fp, xi, 0.0), out=weight_map)
+
             footprint_union |= fp
             # Seeing the object means the space between the camera and it is empty
             corridors |= self.corridor_mask(cam_xz, obj_xz, radius)
@@ -171,7 +240,7 @@ class DirichletObjectMap:
         self.beta[background, self.bg_idx] += self.background_evidence
         self.observed |= footprint_union | background
 
-        return dict(object_cells=int(footprint_union.sum()), background_cells=int(background.sum()),
+        return dict(object_cells=int(footprint_union.sum()), background_cells=int(bg_cells.sum()),
                     skipped=skipped)
 
     # ------------------------------------------------------------------
@@ -242,28 +311,48 @@ class DirichletObjectMap:
     # Saving
     # ------------------------------------------------------------------
 
+    def _color(self, name):
+        c = self.class_colors.get(str(name).lower())
+        if c is not None:
+            return c
+        return plt.get_cmap('tab20')(self.cls_idx.get(name, 0) % 20)
+
+    def overlay_ground_truth(self, ax):
+        """Stars at the ground-truth object positions, filled with the class color.
+        Positions outside the map extent are simply clipped."""
+        if not self.gt_positions:
+            return
+        xlim, ylim = ax.get_xlim(), ax.get_ylim()
+        for name, (gx, gy) in self.gt_positions.items():
+            ax.plot(gx, gy, marker='*', ms=18, mfc=self._color(name), mec='white', mew=1.5,
+                    ls='', zorder=6)
+            ax.annotate(name, (gx, gy), xytext=(0, 10), textcoords='offset points', ha='center',
+                        fontsize=8, zorder=7, bbox=dict(boxstyle='round,pad=0.15', fc='white', alpha=0.85))
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
+
     def _extent(self):
         h = self.res / 2.0
         return [self.x_points[0] - h, self.x_points[-1] + h, self.z_points[0] - h, self.z_points[-1] + h]
 
     def plot_mle(self, save_path, title='MLE class  argmax p(o | z)', robot_xz=None):
-        """Class map of observed cells; grey = never observed."""
+        """Class map of observed cells in the class colors; grey = never observed."""
         mle = self.mle_class()
         present = sorted(set(mle[mle >= 0].tolist()))
         fig, ax = plt.subplots(figsize=(7.5, 6))
         ax.set_facecolor((0.85, 0.85, 0.85))
         if present:
-            lut = {k: i for i, k in enumerate(present)}
             img = np.full(mle.shape, np.nan)
-            for k, i in lut.items():
+            for i, k in enumerate(present):
                 img[mle == k] = i
-            cmap = plt.get_cmap('tab20', max(len(present), 2))
+            cmap = ListedColormap([self._color(self.classes[k]) for k in present])
             im = ax.imshow(img, origin='lower', extent=self._extent(), cmap=cmap,
-                           vmin=-0.5, vmax=max(len(present), 2) - 0.5, aspect='equal')
+                           vmin=-0.5, vmax=len(present) - 0.5, aspect='equal')
             cb = fig.colorbar(im, ax=ax, ticks=range(len(present)))
             cb.ax.set_yticklabels([self.classes[k] for k in present])
+        self.overlay_ground_truth(ax)
         if robot_xz is not None:
-            ax.plot(robot_xz[0], robot_xz[1], marker='o', ms=8, mfc='lime', mec='black', ls='')
+            ax.plot(robot_xz[0], robot_xz[1], marker='o', ms=8, mfc='lime', mec='black', ls='', zorder=8)
         ax.set_title(title)
         ax.set_xlabel('map x (m)')
         ax.set_ylabel('map y (m)')
@@ -281,9 +370,11 @@ class DirichletObjectMap:
                             x_points=self.x_points, z_points=self.z_points)
         with open(os.path.join(out_dir, 'dirichlet_classes.json'), 'w') as f:
             json.dump({'classes': self.classes, 'grid_HW': [self.H, self.W], 'res': self.res,
-                       'extent': self._extent(), 'object_evidence': self.object_evidence,
-                       'background_evidence': self.background_evidence,
-                       'prior_value': self.prior_value, 'radius_clip': [self.min_radius, self.max_radius]},
+                       'extent': self._extent(), 'conf_temper': self.conf_temper,
+                       'bg_false_neg_rate': self.bg_false_neg_rate,
+                       'bg_dist_decay': self.bg_dist_decay,
+                       'prior_value': self.prior_value, 'radius_clip': [self.min_radius, self.max_radius],
+                       'confusion_matrix': self.confusion_matrix.tolist()},
                       f, indent=2)
         if self.similarity_table is not None:
             self.similarity_table.to_csv(os.path.join(out_dir, 'semantic_similarity_table.csv'), index=False)
@@ -294,6 +385,7 @@ class DirichletObjectMap:
             fig, ax = plt.subplots(figsize=(7, 5.5))
             im = ax.imshow(post[:, :, k], origin='lower', extent=extent, cmap='magma', vmin=0, vmax=1,
                            aspect='equal')
+            self.overlay_ground_truth(ax)
             ax.set_title(f'p(o = {cls} | z)')
             fig.colorbar(im, ax=ax, label='probability')
             fig.tight_layout()
@@ -308,6 +400,7 @@ class DirichletObjectMap:
                                 'sum_k p(o_k|z) * sim(class_k, goal)')]:
             fig, ax = plt.subplots(figsize=(7, 5.5))
             im = ax.imshow(arr, origin='lower', extent=extent, cmap='viridis', aspect='equal')
+            self.overlay_ground_truth(ax)
             ax.set_title(lab)
             fig.colorbar(im, ax=ax)
             fig.tight_layout()
