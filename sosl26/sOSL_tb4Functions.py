@@ -1,18 +1,17 @@
-"""TurtleBot4 helpers: image decoding, camera projection, YOLO detection,
+"""TurtleBot4 helpers: pose, image decoding, camera projection, YOLO detection,
 search grid / boundary, and plots.
 
 Nothing in this module imports rclpy, so it can be tested offline.
 
 Coordinate convention
 ---------------------
-The maps use the AI2-THOR (x, z) ground-plane naming, with:
+The maps use the AI2-THOR (x, z) ground-plane naming:
 
-    x  <-  ROS map x
-    z  <-  ROS map y
+    x  =  ROS map x
+    z  =  ROS map y
 
-So `robot_z`, `z_points` and the third entry of a "Position" string
-("x, height, y") are the ROS map *y* coordinate. Positions and top-down plots
-match ROS; only yaw angles differ:
+So `robot_z`, `target_z` and `z_points` are the ROS map *y* coordinate.
+Positions and top-down plots match ROS; only yaw angles differ:
 
     ROS yaw      : counter-clockwise from +x      (atan2(dy, dx))
     ai2thor yaw  : clockwise from +z (= map +y)   ai2thor_yaw_deg = (90 - ros_yaw_deg) mod 360
@@ -27,7 +26,7 @@ from dataclasses import dataclass
 
 import cv2
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use('Agg')   # no display needed: plots are only saved to files
 import matplotlib.cm as cm  # noqa: E402
 import matplotlib.colors as mcolors  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
@@ -55,11 +54,6 @@ def yaw_from_quaternion(qx, qy, qz, qw):
 def ros_yaw_to_ai2thor_deg(yaw_rad):
     """ROS yaw (rad, CCW from +x) -> ai2thor yaw (deg, CW from +z = map +y)."""
     return (90.0 - math.degrees(yaw_rad)) % 360.0
-
-
-def format_position(map_x, map_y, map_z):
-    """Formats a ROS map-frame point as an ai2thor style "x, y, z" string."""
-    return f"{map_x:.2f}, {map_z:.2f}, {map_y:.2f}"
 
 
 # ==========================
@@ -153,10 +147,17 @@ def transform_point(p, translation, quaternion_xyzw):
 
 def optical_to_map_from_robot_pose(p_opt, robot_x, robot_y, robot_yaw, camera_height=0.25):
     """Fallback optical -> map transform when the camera TF is unavailable
-    (level camera looking along the robot heading)."""
+    (level camera at the robot center, looking along the robot heading)."""
     forward, left, up = p_opt[2], -p_opt[0], camera_height - p_opt[1]
     c, s = math.cos(robot_yaw), math.sin(robot_yaw)
     return np.array([robot_x + forward * c - left * s, robot_y + forward * s + left * c, up])
+
+
+def camera_pose_in_map(optical_to_map):
+    """Camera (x, y) and optical-axis yaw in the map frame from an optical -> map transform."""
+    origin = np.asarray(optical_to_map(np.zeros(3)), dtype=float)
+    ahead = np.asarray(optical_to_map(np.array([0.0, 0.0, 1.0])), dtype=float)   # 1 m along the optical axis
+    return (origin[0], origin[1]), math.atan2(ahead[1] - origin[1], ahead[0] - origin[0])
 
 
 # ==========================
@@ -189,16 +190,14 @@ def detect_objects(model, rgb_bgr, depth_m, K, optical_to_map, conf_thr=0.3, exc
         if confidence <= conf_thr or name in exclude_names:
             continue
 
+        # Box center + size (pixels) -> depth of the object -> 3D point in the map frame
         x, y, w, h = (round(v.item()) for v in box.xywh[0])
         d = box_depth(x, y, w, h, depth_m, rgb_bgr.shape, percentile=depth_percentile,
                       min_depth=depth_range[0], max_depth=depth_range[1])
         if d <= 0:
-            continue
-        p_map = optical_to_map(pixel_to_optical(x, y, d, K))
-        if p_map is None:
-            continue
-        map_x, map_y, map_z = (float(v) for v in p_map)
-        radius = (w / 2.0) * d / K[0]
+            continue   # no valid depth in the box (too close / too far / invalid)
+        map_x, map_y, map_z = (float(v) for v in optical_to_map(pixel_to_optical(x, y, d, K)))
+        radius = (w / 2.0) * d / K[0]   # half the box width in meters at that depth
         detections.append(dict(objectType=name, Conf=confidence, map_x=map_x, map_y=map_y,
                                map_z=map_z, depth=d, radius=radius))
         logger(f"Detected {name} ({confidence:.2f}) at depth {d:.2f} m, radius {radius:.2f} m "
@@ -216,24 +215,34 @@ def detect_objects(model, rgb_bgr, depth_m, K, optical_to_map, conf_thr=0.3, exc
 
 @dataclass
 class SearchGrid:
-    """Search grid (z = map y).
+    """Grid of candidate source cells (z = map y); row 0 is the lowest z.
 
-    `inside` (bool, one entry per grid cell) marks where the source may be;
-    source probabilities are 0 elsewhere. `mask` (bool, any resolution over
-    `bounds`) marks free space and is only used for plots.
+    `inside` (bool, (len(z_points), len(x_points))) marks the cells inside the
+    search boundary; source probabilities are 0 everywhere else.
     """
 
-    x_points: np.ndarray
-    z_points: np.ndarray
-    bounds: tuple                      # (min_x, max_x, min_z, max_z) of `mask`
-    mask: np.ndarray                   # row 0 at min_z
-    inside: np.ndarray                 # (len(z_points), len(x_points))
+    x_points: np.ndarray               # cell centres along map x
+    z_points: np.ndarray               # cell centres along map y
+    step: float                        # cell size (m)
+    inside: np.ndarray
 
+    def extent(self):
+        """[x_min, x_max, z_min, z_max] of the cell edges, for imshow."""
+        h = self.step / 2.0
+        return [self.x_points[0] - h, self.x_points[-1] + h, self.z_points[0] - h, self.z_points[-1] + h]
 
-def _grid_points(lo, hi, step):
-    lo = np.floor(lo / step) * step
-    hi = np.floor(hi / step) * step
-    return np.round(np.arange(lo, hi + step / 2.0, step), 3)
+    def nearest_cell(self, x, z):
+        """(row, col) of the cell closest to map (x, z)."""
+        return int(np.abs(self.z_points - z).argmin()), int(np.abs(self.x_points - x).argmin())
+
+    def contains(self, x, z):
+        """True if the cell nearest to map (x, z) is inside the boundary."""
+        return bool(self.inside[self.nearest_cell(x, z)])
+
+    def argmax_xz(self, prob_map):
+        """Map (x, z) of the most likely cell of prob_map, and its (row, col)."""
+        row, col = np.unravel_index(np.argmax(prob_map), prob_map.shape)
+        return np.array([self.x_points[col], self.z_points[row]]), (row, col)
 
 
 def points_in_polygon(xs, zs, polygon, margin=0.0):
@@ -242,7 +251,8 @@ def points_in_polygon(xs, zs, polygon, margin=0.0):
     poly = np.asarray(polygon, dtype=float)
     inside = Path(poly).contains_points(pts)
     if margin > 0:
-        a, b = poly, np.roll(poly, -1, axis=0)       # polygon edges a -> b
+        # Distance of every point to every edge a -> b (projection clipped to the segment)
+        a, b = poly, np.roll(poly, -1, axis=0)
         ab = b - a
         t = np.clip(((pts[:, None, :] - a) * ab).sum(-1) / (ab * ab).sum(-1), 0.0, 1.0)
         dist = np.linalg.norm(pts[:, None, :] - (a + t[..., None] * ab), axis=-1).min(axis=1)
@@ -251,37 +261,13 @@ def points_in_polygon(xs, zs, polygon, margin=0.0):
 
 
 def grid_from_polygon(polygon, step=0.25, margin=0.0):
-    """Search grid over the bounding box of `polygon`; cells outside it are excluded."""
+    """Search grid over the bounding box of `polygon`; a cell is inside if its centre is."""
     poly = np.asarray(polygon, dtype=float)
-    x_points = _grid_points(poly[:, 0].min(), poly[:, 0].max(), step)
-    z_points = _grid_points(poly[:, 1].min(), poly[:, 1].max(), step)
+    # Cell centres on multiples of `step`, from the box's lower edge up to its upper edge
+    x_points = np.round(np.arange(np.floor(poly[:, 0].min() / step) * step, poly[:, 0].max() + step / 2, step), 3)
+    z_points = np.round(np.arange(np.floor(poly[:, 1].min() / step) * step, poly[:, 1].max() + step / 2, step), 3)
     Xc, Zc = np.meshgrid(x_points, z_points)
-    inside = points_in_polygon(Xc, Zc, poly, margin)
-    h = step / 2.0
-    bounds = (x_points[0] - h, x_points[-1] + h, z_points[0] - h, z_points[-1] + h)
-    return SearchGrid(x_points, z_points, bounds, inside, inside)
-
-
-def grid_from_occupancy(occ, resolution, origin_x, origin_y, step=0.25, margin=0.5, free_thresh=25):
-    """Search grid from a nav_msgs/OccupancyGrid (int8 (height, width), -1 unknown, row 0 at origin_y).
-
-    The map is cropped to its known cells (+ margin). Every grid cell may hold the source.
-    """
-    occ = np.asarray(occ)
-    known_r, known_c = np.nonzero(occ >= 0)
-    if known_r.size == 0:
-        raise ValueError("Occupancy grid has no known cells.")
-    pad = int(math.ceil(margin / resolution))
-    r0, r1 = max(0, known_r.min() - pad), min(occ.shape[0], known_r.max() + 1 + pad)
-    c0, c1 = max(0, known_c.min() - pad), min(occ.shape[1], known_c.max() + 1 + pad)
-    crop = occ[r0:r1, c0:c1]
-    bounds = (origin_x + c0 * resolution, origin_x + c1 * resolution,
-              origin_y + r0 * resolution, origin_y + r1 * resolution)
-    x_points = _grid_points(bounds[0], bounds[1], step)
-    z_points = _grid_points(bounds[2], bounds[3], step)
-    free = (crop >= 0) & (crop < free_thresh)
-    inside = np.ones((len(z_points), len(x_points)), dtype=bool)
-    return SearchGrid(x_points, z_points, bounds, free, inside)
+    return SearchGrid(x_points, z_points, step, points_in_polygon(Xc, Zc, poly, margin))
 
 
 # ==========================
@@ -294,28 +280,29 @@ def _minmax(m):
     return (m - lo) / (hi - lo) if hi - lo > 1e-12 else np.zeros_like(m)
 
 
-def _draw_boundary(ax, polygon):
-    if polygon is not None:
-        ax.add_patch(Polygon(polygon, closed=True, fill=False, edgecolor='deepskyblue',
-                             linewidth=1.5, linestyle='--', zorder=3))
+def draw_boundary(ax, polygon):
+    """Dashed outline of the search boundary."""
+    ax.add_patch(Polygon(polygon, closed=True, fill=False, edgecolor='deepskyblue',
+                         linewidth=1.5, linestyle='--', zorder=3))
 
 
-def save_belief_maps(panels, x_points, z_points, out_fname, trajectory=None, boundary=None):
-    """Saves a row of belief maps (min-max normalised, 'hot'), e.g. olfactory / visual / fused.
+def save_belief_maps(panels, grid, out_fname, trajectory=None, boundary=None):
+    """Saves a row of belief maps (each min-max normalised, 'hot'), e.g. olfactory / visual / fused.
 
     panels : list[(map, title)]
+    trajectory : list[(x, z)] robot path, drawn from start (lime) to now (cyan)
     """
     n = len(panels)
     fig, axes = plt.subplots(1, n, figsize=(4 * n, 5), sharex=True, sharey=True, squeeze=False)
-    h = (x_points[1] - x_points[0]) / 2.0 if len(x_points) > 1 else 0.0   # extent = cell edges
-    extent = [x_points[0] - h, x_points[-1] + h, z_points[0] - h, z_points[-1] + h]
+    extent = grid.extent()
 
     for i, (ax, (raw, title)) in enumerate(zip(axes[0], panels)):
         img = cv2.applyColorMap((_minmax(raw) * 255).astype(np.uint8), cv2.COLORMAP_HOT)
         ax.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), origin='lower', extent=extent, aspect='equal')
         ax.set_title(title, fontsize=TITLE_FONTSIZE)
         ax.grid(True, linestyle='--', linewidth=0.5, alpha=0.6)
-        _draw_boundary(ax, boundary)
+        if boundary is not None:
+            draw_boundary(ax, boundary)
         if trajectory:
             tx, tz = zip(*trajectory)
             ax.plot(tx, tz, '-', color='cyan', linewidth=1.5, zorder=4)
@@ -324,9 +311,9 @@ def save_belief_maps(panels, x_points, z_points, out_fname, trajectory=None, bou
         ax.set_xlim(extent[0], extent[1])
         ax.set_ylim(extent[2], extent[3])
 
+        # A colorbar axis on every panel keeps them the same size; only the last one is shown.
         cax = make_axes_locatable(ax).append_axes("right", size="5%", pad=0.1)
-        sm = cm.ScalarMappable(cmap='hot', norm=mcolors.Normalize(vmin=0.0, vmax=1.0))
-        plt.colorbar(sm, cax=cax)
+        plt.colorbar(cm.ScalarMappable(cmap='hot', norm=mcolors.Normalize(vmin=0.0, vmax=1.0)), cax=cax)
         cax.set_visible(i == n - 1)
 
     plt.tight_layout()
@@ -336,10 +323,11 @@ def save_belief_maps(panels, x_points, z_points, out_fname, trajectory=None, bou
 
 def plot_tb4_trajectory(trajectory_log_path, grid, save_path, source_xz=None, estimate_xz=None,
                         plume_params=None, boundary=None):
-    """Top-down trajectory plot: plume field (if the source is known), non-free cells
-    greyed out, start (lime), end (cyan), source (red star, 1 m circle) and estimate (yellow X)."""
+    """Top-down trajectory plot: plume field (if the source is known), cells outside the
+    boundary greyed out, start (lime), end (cyan), source (red star, 1 m circle) and
+    final estimate (yellow X)."""
     df = pd.read_csv(trajectory_log_path)
-    min_x, max_x, min_z, max_z = grid.bounds
+    min_x, max_x, min_z, max_z = grid.extent()
     fig, ax = plt.subplots(figsize=(6, 6))
 
     if source_xz is not None:
@@ -347,11 +335,12 @@ def plot_tb4_trajectory(trajectory_log_path, grid, save_path, source_xz=None, es
         ax.contourf(X, Z, gaussian_plume(X, Z, tuple(source_xz), **(plume_params or {})),
                     levels=60, cmap='magma_r', zorder=1)
 
-    overlay = np.zeros(grid.mask.shape + (4,))
-    overlay[..., :3] = 0.8
-    overlay[..., 3] = ~grid.mask
-    ax.imshow(overlay, extent=[min_x, max_x, min_z, max_z], origin='lower', zorder=2, alpha=0.5, aspect='auto')
-    _draw_boundary(ax, boundary)
+    outside = np.zeros(grid.inside.shape + (4,))   # RGBA: grey, opaque where outside
+    outside[..., :3] = 0.8
+    outside[..., 3] = ~grid.inside
+    ax.imshow(outside, extent=grid.extent(), origin='lower', zorder=2, alpha=0.5, aspect='auto')
+    if boundary is not None:
+        draw_boundary(ax, boundary)
 
     if not df.empty:
         ax.plot(df.robot_x, df.robot_z, color='purple', linewidth=1.5, zorder=4)

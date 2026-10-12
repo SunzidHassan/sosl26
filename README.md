@@ -7,13 +7,12 @@ This is the TB4 port of the AI2-THOR `sOSL_main.py` / `fusion_controller.py` pip
 
 | File | Role |
 | --- | --- |
-| `sOSL_olfactionFunctions.py` | Gaussian plume, `BayesianAgent` (plume with `q_s`, `D`, `tau`), `map_entropy` |
-| `sOSL_tb4Functions.py` | TB4 helpers: image decoding, depth-based 3D localisation, YOLO `detect_objects`, search grid (boundary polygon or `/map`), plots |
+| `sOSL_tb4_main.py` | `main()`: the experiment parameters, run folder, ROS executor loop |
+| `tb4_base_controller.py` | `ExperimentConfig` (every parameter with its default) and `TB4BaseController`: the olfactory-only (`'O'`) node (pose, olfaction, Bayesian map, step loop, logging, `navigate()` stub) |
+| `tb4_fusion_controller.py` | `TB4FusionController` (`'F'`): adds the camera, YOLO and the Dirichlet map, and fuses vision with olfaction |
+| `sOSL_olfactionFunctions.py` | Gaussian plume, `BayesianAgent`, `map_entropy` |
 | `sOSL_dirichletFunctions.py` | Dirichlet object map (the vision branch) |
-| `tb4_base_controller.py` | `ExperimentConfig` + shared node: pose, map, olfaction, logging, `navigate()` stub |
-| `tb4_olfactory_controller.py` | `'O'`: olfactory map only (no camera, no YOLO) |
-| `tb4_fusion_controller.py` | `'F'`: olfaction + Dirichlet vision |
-| `sOSL_tb4_main.py` | `main()`: experiment parameters |
+| `sOSL_tb4Functions.py` | Helpers without ROS: image decoding, camera projection, YOLO `detect_objects`, search grid and boundary, plots |
 
 ## Experiments (set in `main()`)
 
@@ -31,8 +30,7 @@ This is the TB4 port of the AI2-THOR `sOSL_main.py` / `fusion_controller.py` pip
 
 `search_boundary` in `main()` lists the corners `(x, y)` of the search area in the map frame, in order around it.
 The grid covers its bounding box, and the olfactory, visual and fused source probabilities are 0 outside it.
-`boundary_margin` (m) also counts cells that close to the boundary as inside. With `search_boundary = None` the grid
-comes from `/map` and has no boundary.
+`boundary_margin` (m) also counts cells that close to the boundary as inside. `/map` is not used.
 
 ## Build and run
 
@@ -40,7 +38,7 @@ comes from `/map` and has no boundary.
 pip install ultralytics sentence-transformers
 cd ~/<ws> && colcon build --symlink-install --packages-select sosl26 && source install/setup.bash
 
-# Terminal 1: localization in a saved map (publishes /map and map -> base_footprint)
+# Terminal 1: localization in a saved map (publishes the TF map -> base_footprint)
 # Terminal 2: keyboard control
 ros2 run teleop_twist_keyboard teleop_twist_keyboard
 # Terminal 3

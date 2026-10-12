@@ -1,4 +1,9 @@
-"""Olfaction: Gaussian plume model and the Bayesian source map."""
+"""Olfaction: Gaussian plume model and the Bayesian source map P(src | C).
+
+For every candidate source cell the plume model predicts the concentration
+the robot should measure; each step multiplies the map by how well that
+prediction matches the measured (rescaled) concentration.
+"""
 
 import math
 
@@ -8,16 +13,21 @@ import numpy as np
 def gaussian_plume(x, z, source, q_s=2000, D=10, U=0, tau=1000, psi_deg=0):
     """Concentration at (x, z) for a source at `source` = (x_s, z_s).
 
-    q_s: emission rate, D: diffusion coefficient, U: wind speed at angle
-    psi_deg, tau: decay time. Works on scalars and numpy arrays.
+        c = q_s / (4 pi D r) * exp(-del_z U / (2 D) - r / lambda)
+        lambda = sqrt(D tau / (1 + tau U^2 / (4 D)))
+
+    q_s: emission rate, D: diffusion coefficient, tau: decay time, U: wind
+    speed and psi_deg its direction; r is the distance to the source and
+    del_z the downwind offset. With U = 0 the plume is radially symmetric.
+    x, z and the source coordinates can be scalars or numpy arrays.
     """
     psi = math.radians(psi_deg)
-    lambd = math.sqrt((D * tau) / (1 + (tau * U**2) / (4 * D)))
+    lambd = math.sqrt((D * tau) / (1 + (tau * U**2) / (4 * D)))   # decay length
     delta_x = np.asarray(x, dtype=float) - source[0]
     delta_z = np.asarray(z, dtype=float) - source[1]
     r = np.hypot(delta_x, delta_z)
-    r = np.where(r == 0, 1e-3, r)
-    del_z = -(delta_x * math.cos(psi) + delta_z * math.sin(psi))
+    r = np.where(r == 0, 1e-3, r)                                    # avoid division by 0 at the source
+    del_z = -(delta_x * math.cos(psi) + delta_z * math.sin(psi))     # offset along the wind
     return q_s / (4 * math.pi * D * r) * np.exp((-del_z * U) / (2 * D) - r / lambd)
 
 
