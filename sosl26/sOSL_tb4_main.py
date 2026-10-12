@@ -6,7 +6,7 @@ Set the experiment parameters in main() below. Drive the robot with keyboard
 teleop (e.g. `ros2 run teleop_twist_keyboard teleop_twist_keyboard`); the
 controller only senses, fuses and logs. Stop with Ctrl+C or 'q' in the
 YOLO window: all results are written to
-    <sosl26>/save/save_F_{Odor}_{vision_mode}/{entropy_frac}/{run}/   (fusion)
+    <sosl26>/save/save_F_{Odor}_dirichlet/{entropy_frac}/{run}/       (fusion)
     <sosl26>/save/save_O_{Odor}/{entropy_frac}/{run}/                 (olfactory-only)
 """
 
@@ -22,7 +22,6 @@ import rclpy
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 
 from tb4_base_controller import ExperimentConfig
-# from sosl26.tb4_base_controller import ExperimentConfig
 
 
 def default_save_root():
@@ -66,8 +65,7 @@ def resolve_concentration(value):
 
 def main(args=None):
     # ---------------- Experiment parameters ----------------
-    alg_choice = 'F'                 # 'F' fusion (olfaction + vision) | 'O' olfactory-only
-    vision_mode = 'dirichlet'        # 'F' only: 'navKnowledge' (AI2-THOR object list) | 'dirichlet' (object map)
+    alg_choice = 'F'                 # 'F' fusion (olfaction + Dirichlet vision) | 'O' olfactory-only
     odor = "burnt"
     entropy_frac = 0.8
     sample_period = 5.0              # n: step window (s). Stop the robot; olfaction is averaged over it
@@ -86,26 +84,26 @@ def main(args=None):
     olfaction_max_conc = 610
     olfaction_min_conc = 400         # dummy min (measured: 'testData/2026-09-15_sensorDump_low/olfaction_data.csv')
 
-    # Map / ground truth (ROS map frame)
-    map_bounds = None                # (x_min, x_max, y_min, y_max); None = use /map
-    source_position = (-6.4, -0.5)           # ground-truth source (x, y) if known, for evaluation only
+    # Search area (ROS map frame x, y), corners in order around the boundary. The grid covers its
+    # bounding box and the source probability is 0 outside it. None = grid from /map, no boundary.
+    search_boundary = [
+        (-7.5, -6.4),    # South East corner
+        (-6.0, -1.0),    # Middle East
+        (-3.0, -1.0),    # Center
+        (0.0, -3.0),     # North East
+        (0.0, 0.0),      # North West
+        (-7.5, -0.7),    # South West
+    ]
+    boundary_margin = 0.0            # m; cells this close to the boundary also count as inside
+    source_position = (-6.4, -0.5)   # ground-truth source (x, y) if known, for evaluation only
 
     # Vision
     yolo_model_path = "models/YOLO/neth234YOLO26m100epoch.pt"
     yolo_conf = 0.3
     yolo_exclude_classes = []
-    # yolo_exclude_classes = ["person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light",
-    # "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
-    # "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
-    # "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle",
-    # "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
-    # "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch", "potted plant", "bed",
-    # "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard", "cell phone", "oven",
-    # "sink", "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush"]
 
-    # Dirichlet object map (vision_mode 'dirichlet')
-    # Dirichlet object map (vision_mode 'dirichlet'): YOLO validation metrics (Five_Objects.yolo26, 88 val images)
-    # Dirichlet object map: YOLO26m validation confusion matrix (normalized; rows predicted, columns true)
+    # Dirichlet object map: YOLO26m validation confusion matrix (Five_Objects.yolo26, 88 val images;
+    # normalized, rows predicted, columns true)
     dirichlet_conf_labels = ['Cardboard box', 'Garbage can', 'Microwave', 'Refrigerator', 'Toaster', 'background']
     dirichlet_conf_matrix = [
         [0.91, 0.00, 0.00, 0.00, 0.00, 0.12],   # pred Cardboard box
@@ -140,7 +138,6 @@ def main(args=None):
     cfg = ExperimentConfig(
         odor=odor,
         alg_choice=alg_choice,
-        vision_mode=vision_mode,
         entropy_frac=entropy_frac,
         sample_period=sample_period,
         vision_period=vision_period,
@@ -152,7 +149,8 @@ def main(args=None):
         sigma_noise=sigma_noise,
         olfaction_min_conc=resolve_concentration(olfaction_min_conc),
         olfaction_max_conc=resolve_concentration(olfaction_max_conc),
-        map_bounds=map_bounds,
+        search_boundary=search_boundary,
+        boundary_margin=boundary_margin,
         source_position=source_position,
         yolo_conf=yolo_conf,
         yolo_exclude_classes=yolo_exclude_classes,
@@ -170,7 +168,7 @@ def main(args=None):
         raise ValueError(f"alg_choice must be 'F' or 'O', got '{alg_choice}'")
 
     odor_tag = re.sub(r"[^A-Za-z0-9]+", "", odor.title())
-    alg_folder = f"save_{alg_choice}_{odor_tag}" + (f"_{vision_mode}" if alg_choice == 'F' else "")
+    alg_folder = f"save_{alg_choice}_{odor_tag}" + ("_dirichlet" if alg_choice == 'F' else "")
     base_save_dir = os.path.join(save_root, alg_folder, str(entropy_frac))
     run_serial, save_dir = next_run_dir(base_save_dir)
     print(f"--- STARTING TB4 RUN {run_serial} --- Saving files to: {save_dir}")
@@ -182,16 +180,15 @@ def main(args=None):
     if alg_choice == 'F':
         from ultralytics import YOLO
         from tb4_fusion_controller import TB4FusionController
-        # from sosl26.tb4_fusion_controller import TB4FusionController
         node = TB4FusionController(cfg, YOLO(yolo_model_path), save_dir)
     else:
         from tb4_olfactory_controller import TB4OlfactoryController
-        # from sosl26.tb4_olfactory_controller import TB4OlfactoryController
         node = TB4OlfactoryController(cfg, save_dir)
     # Sensor callbacks and processing (steps / YOLO) run in parallel threads;
     # the OpenCV window is driven from this (main) thread.
     executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
+
     def spin():
         try:
             executor.spin()

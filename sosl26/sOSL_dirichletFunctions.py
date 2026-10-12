@@ -1,4 +1,4 @@
-"""Dirichlet evidence accumulation object map (second vision approach).
+"""Dirichlet evidence accumulation object map (the vision branch of the fusion controller).
 
 Per grid cell c, a Dirichlet over K = (object classes + Background) holds
 evidence beta[c]. The posterior class distribution is
@@ -55,6 +55,7 @@ from matplotlib.colors import ListedColormap  # noqa: E402
 
 BACKGROUND = 'Background'
 
+
 def confusion_matrix_from_normalized(classes, matrix, labels, bg_fp_rate=0.05,
                                      background=BACKGROUND, bg_label='background'):
     """C[pred][true] (columns sum to 1) in DirichletObjectMap.classes order
@@ -86,6 +87,7 @@ def confusion_matrix_from_normalized(classes, matrix, labels, bg_fp_rate=0.05,
     for j in range(n):                      # rounding: 0.91 + 0.04 + 0.04 = 0.99
         C[:, j] /= C[:, j].sum()
     return C
+
 
 class DirichletObjectMap:
 
@@ -187,28 +189,21 @@ class DirichletObjectMap:
         Parameters
         ----------
         detections : list[dict]
-            From sOSL_tb4Functions.visionBranch -- expects objectType,
-            map_x, map_y, radius, and confidence (YOLO box confidence, 0-1).
+            From sOSL_tb4Functions.detect_objects: objectType, map_x, map_y,
+            radius and Conf (YOLO box confidence, 0-1).
         cam_xz : tuple
             Camera position (map x, map y).
         heading : float
             Camera optical axis yaw in the map frame (rad, ROS convention).
         hfov : float
             Horizontal field of view (rad).
-
-        Returns
-        -------
-        dict
-            Number of object / background cells updated and skipped detections.
         """
         footprint_union = np.zeros((self.H, self.W), dtype=bool)
         contrib = {}   # predicted-class idx -> (H, W) max-confidence-weight map
-        skipped = []
 
         for det in detections:
             name = det['objectType']
             if name not in self.cls_idx or name == self.background:
-                skipped.append(name)
                 continue
             obj_xz = (det['map_x'], det['map_y'])
             radius = float(np.clip(det.get('radius', self.min_radius), self.min_radius, self.max_radius))
@@ -242,9 +237,6 @@ class DirichletObjectMap:
         self.beta[bg_cells, self.bg_idx] += bg_strength[bg_cells]
 
         self.observed |= footprint_union | bg_cells
-
-        return dict(object_cells=int(footprint_union.sum()), background_cells=int(bg_cells.sum()),
-                    skipped=skipped)
 
     # ------------------------------------------------------------------
     # Posterior / uncertainty
@@ -296,11 +288,15 @@ class DirichletObjectMap:
         """sum_k p(o_k | z_c) * weight_k, shape (H, W)."""
         return np.tensordot(self.posterior(), self.class_weights, axes=([2], [0]))
 
-    def source_prob_given_vision(self):
+    def source_prob_given_vision(self, inside=None):
+        """P(src | V): the semantic likelihood map normalised over the cells in `inside` (0 elsewhere)."""
         sem = self.semantic_likelihood_map()
+        if inside is not None:
+            sem = np.where(inside, sem, 0.0)
         total = sem.sum()
         if total < 1e-12:
-            return np.full_like(sem, 1.0 / sem.size)
+            uniform = np.ones_like(sem) if inside is None else np.asarray(inside, dtype=float)
+            return uniform / uniform.sum()
         return sem / total
 
     def top_object_at(self, row, col):
@@ -409,6 +405,7 @@ class DirichletObjectMap:
             fig.tight_layout()
             fig.savefig(os.path.join(maps_dir, f'{name}.png'), dpi=120)
             plt.close(fig)
+
 
 def camera_pose_in_map(optical_to_map):
     """Camera (x, y) and optical-axis yaw in the map frame from an optical->map transform."""

@@ -9,15 +9,16 @@ TB4BaseController does everything that the olfactory-only ('O') and fusion
      Bayesian source map with that mean,
   3. calls `perceive()` (implemented by the subclass) for vision / fusion; the
      fusion controller processes camera frames continuously during the window,
-  4. saves the maps and the trajectory log (same files as the AI2-THOR runs),
+  4. saves the maps and the trajectory log,
   5. calls navigate(), which is currently a no-op (drive with teleop).
+
+Source probabilities are 0 outside `search_boundary` (if set).
 
 Subclasses:
   tb4_olfactory_controller.TB4OlfactoryController  ('O')
-  tb4_fusion_controller.TB4FusionController        ('F', vision_mode 'navKnowledge' | 'dirichlet')
+  tb4_fusion_controller.TB4FusionController        ('F', Dirichlet object map)
 
-See sOSL_tb4Functions.py for the ai2thor <-> ROS axis convention
-(robot_z / z_points == ROS map y).
+See sOSL_tb4Functions.py for the axis convention (robot_z / z_points == ROS map y).
 """
 
 import json
@@ -35,23 +36,20 @@ import pandas as pd
 import rclpy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.node import Node
-from rclpy.qos import (DurabilityPolicy, QoSProfile, ReliabilityPolicy,
-                       qos_profile_sensor_data)
-from geometry_msgs.msg import Twist, Vector3
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+from geometry_msgs.msg import Vector3
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import CameraInfo, CompressedImage
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 
-from sOSL_loggerFunctions import map_entropy
-from sOSL_olfactionFunctions import gaussian_plume
+from sOSL_olfactionFunctions import BayesianAgent, map_entropy
 from sOSL_tb4Functions import (
-    TB4BayesianAgent,
     decode_compressed_depth,
     decode_compressed_rgb,
-    grid_from_bounds,
     grid_from_occupancy,
+    grid_from_polygon,
     intrinsics_from_fov,
     optical_to_map_from_robot_pose,
     plot_tb4_trajectory,
@@ -61,7 +59,6 @@ from sOSL_tb4Functions import (
     transform_point,
     yaw_from_quaternion,
 )
-from sOSL_utils import grid_to_world, parse_position_string, world_to_grid
 
 
 # ==========================
@@ -73,14 +70,13 @@ class ExperimentConfig:
     """All experiment parameters. Filled in sOSL_tb4_main.main()."""
 
     # --- Task ---
-    alg_choice: str = 'F'                      # 'F' fusion, 'O' olfactory-only
-    vision_mode: str = 'navKnowledge'          # 'F' only: 'navKnowledge' (object list) | 'dirichlet' (object map)
+    alg_choice: str = 'F'                      # 'F' fusion (olfaction + Dirichlet vision), 'O' olfactory-only
     odor: str = "burnt"
     goal_phrase: Optional[str] = None          # default: f"Is emitting {odor} odor:"
     entropy_frac: float = 0.8
 
     # --- Sampling / run limits ---
-    sample_period: float = 5.0                 # step window (s): olfaction is averaged over it, vision frames accumulate
+    sample_period: float = 5.0                 # step window (s): olfaction is averaged, vision frames accumulate
     vision_period: float = 0.5                 # 'F': process a new camera frame at most every vision_period s
     save_vision_frames: bool = True            # 'F': save the annotated YOLO image of every processed frame
     step_threshold: int = 100
@@ -93,7 +89,6 @@ class ExperimentConfig:
     U: float = 0.0
     psi_deg: float = 0.0
     sigma_noise: float = 1.5
-    use_simulated_olfaction: bool = False      # replace /olfaction by gaussian_plume(source_position)
     # Linear rescaling of raw /olfaction readings before the Bayesian update:
     #   rescaled = olfaction_rescale_to * (raw - olfaction_min_conc) / (olfaction_max_conc - olfaction_min_conc)
     # (min -> 0, max -> olfaction_rescale_to; not clipped). None for both = use raw readings.
@@ -103,25 +98,26 @@ class ExperimentConfig:
 
     # --- Map / grid ---
     grid_step: float = 0.25
-    map_bounds: Optional[Tuple[float, float, float, float]] = None  # (x_min, x_max, y_min, y_max) map frame
-    map_wait_timeout: float = 10.0
-    fallback_map_size: float = 10.0            # square around the start pose if no /map and no bounds
+    # Search area: polygon corners [(x, y), ...] in the map frame, in order around the boundary.
+    # The grid covers its bounding box and source probabilities are 0 outside it.
+    # None = grid from /map, no boundary.
+    search_boundary: Optional[Sequence[Tuple[float, float]]] = None
+    boundary_margin: float = 0.0               # cells within this distance (m) of the boundary count as inside
     source_position: Optional[Tuple[float, float]] = None           # ground truth (x, y) map frame, optional
 
     # --- Vision (F only) ---
     yolo_conf: float = 0.3
-    yolo_target_classes: Optional[Sequence[str]] = None             # None = all model classes
     yolo_exclude_classes: Sequence[str] = field(default_factory=list)
     depth_percentile: float = 50.0
     depth_range: Tuple[float, float] = (0.2, 5.0)
-    merge_dist: float = 0.1
     camera_hfov_deg: float = 69.0              # only used until CameraInfo arrives
     camera_height: float = 0.25                # only used if the camera TF is unavailable
+    sentence_model: str = 'all-mpnet-base-v2'  # class name <-> goal phrase similarity
 
-    # --- Dirichlet object map (vision_mode 'dirichlet') ---
+    # --- Dirichlet object map ---
     dirichlet_conf_matrix: Optional[Sequence[Sequence[float]]] = None  # normalized, rows predicted / cols true
     dirichlet_conf_labels: Optional[Sequence[str]] = None              # axis order, background last
-    dirichlet_bg_fp_rate: float = 0.05            # P(any false detection | background region)\
+    dirichlet_bg_fp_rate: float = 0.05            # P(any false detection | background region)
     dirichlet_conf_temper: float = 1.0            # evidence weight = YOLO confidence * conf_temper
     dirichlet_bg_false_neg_rate: Optional[float] = None  # eta; None = 1 - mean recall
     dirichlet_bg_dist_decay: float = 0.5          # lambda: free-space evidence decay with distance
@@ -136,7 +132,6 @@ class ExperimentConfig:
     camera_info_topic: str = "/oakd/rgb/camera_info"
     olfaction_topic: str = "/olfaction"
     map_topic: str = "/map"
-    cmd_vel_topic: str = "/cmd_vel"
     map_frame: str = "map"
     base_frame: str = "base_footprint"
     camera_frame: str = ""                     # "" = use the RGB image header frame_id
@@ -174,52 +169,41 @@ class TB4BaseController(Node):
         self.sensor_group = MutuallyExclusiveCallbackGroup()
         self.processing_group = MutuallyExclusiveCallbackGroup()
 
-        # --- TF ---
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # --- Subscriptions (sensor QoS matches both reliable and best-effort publishers) ---
-        if self.uses_camera:
-            self.create_subscription(CompressedImage, cfg.rgb_topic, self.image_callback, qos_profile_sensor_data,
-                                     callback_group=self.sensor_group)
-            self.create_subscription(CompressedImage, cfg.depth_topic, self.depth_callback, qos_profile_sensor_data,
-                                     callback_group=self.sensor_group)
-            self.create_subscription(CameraInfo, cfg.camera_info_topic, self.camera_info_callback,
-                                     qos_profile_sensor_data, callback_group=self.sensor_group)
-        self.create_subscription(Vector3, cfg.olfaction_topic, self.olfactory_callback, qos_profile_sensor_data,
-                                 callback_group=self.sensor_group)
-        map_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
-                             durability=DurabilityPolicy.TRANSIENT_LOCAL)
-        self.create_subscription(OccupancyGrid, cfg.map_topic, self.map_callback, map_qos,
-                                 callback_group=self.sensor_group)
+        def subscribe(msg_type, topic, callback, qos=qos_profile_sensor_data):
+            self.create_subscription(msg_type, topic, callback, qos, callback_group=self.sensor_group)
 
-        # Reserved for navigate(). Nothing is published yet, so keyboard
-        # teleop on /cmd_vel is not overridden.
-        self.cmd_vel_pub = self.create_publisher(Twist, cfg.cmd_vel_topic, 10)
+        if self.uses_camera:
+            subscribe(CompressedImage, cfg.rgb_topic, self.image_callback)
+            subscribe(CompressedImage, cfg.depth_topic, self.depth_callback)
+            subscribe(CameraInfo, cfg.camera_info_topic, self.camera_info_callback)
+        subscribe(Vector3, cfg.olfaction_topic, self.olfactory_callback)
+        if cfg.search_boundary is None:
+            subscribe(OccupancyGrid, cfg.map_topic, self.map_callback,
+                      QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                                 durability=DurabilityPolicy.TRANSIENT_LOCAL))
 
         # --- Sensor state ---
         self.latest_rgb = None
         self.rgb_seq = 0             # incremented per decoded RGB frame
         self.rgb_frame_id = ""
         self.latest_depth = None
+        self.latest_annotated = None
         self.cam_K = None            # (fx, fy, cx, cy) from CameraInfo
         self.cam_info_size = (0, 0)  # (width, height)
-        self.olfactionWindDirection = 0.0
-        self.olfactionWindSpeed = 0.0
-        self.olfactionChemicalConc = 0.0
-        self.olfaction_received = False
-        self.olfaction_raw = []
+        self.olfaction_raw = []      # every /olfaction message
         self.map_msg = None
-        self.latest_annotated = None
 
         # --- Algorithm state ---
         self.grid = None
         self.bayesian_agent = None
-        self.H_max = None
         self.entropy_threshold = None
-        self.start_pose = None
         self.step_count = 0
         self.trajectory_log_list = []
+        self.last_target_xz = None
         self.window_start = None     # start of the current step window (s since start_time)
         self.window_olf_idx = 0      # index of the window's first reading in olfaction_raw
 
@@ -249,14 +233,15 @@ class TB4BaseController(Node):
         Returns
         -------
         dict with keys
-            panels : list[(map, title)]  maps drawn in maps_all_*.png
+            panels : list[(map, title)]  maps drawn in maps_all_*.png after the olfactory one
             arrays : dict[str, np.ndarray]  saved in maps_XXX.npz
-            target_object, target_coordinate (ai2thor "x, y, z" string), target_xz (map x, y) or None
+            target_object, target_xz (map x, y)
             visual_entropy, fused_entropy : float
+            log : dict  extra trajectory_log columns (optional)
         """
         raise NotImplementedError
 
-    def save_perception_outputs(self, step_count, tag):
+    def save_perception_outputs(self, step_count, tag, pose):
         """Per-step files beyond the maps and the trajectory log."""
 
     def finalize_perception(self):
@@ -293,11 +278,6 @@ class TB4BaseController(Node):
 
     def olfactory_callback(self, msg: Vector3):
         # x: wind direction, y: wind speed, z: chemical concentration
-        self.olfactionWindDirection = msg.x
-        self.olfactionWindSpeed = msg.y
-        self.olfactionChemicalConc = msg.z
-        self.olfaction_received = True
-
         pose = self.get_robot_pose(warn=False)
         self.olfaction_raw.append({
             "time": round(self.now(), 3),
@@ -378,53 +358,35 @@ class TB4BaseController(Node):
 
     def setup_search(self, pose):
         cfg = self.cfg
-        if cfg.map_bounds is not None:
-            x_min, x_max, y_min, y_max = cfg.map_bounds
-            self.grid = grid_from_bounds(x_min, x_max, y_min, y_max, cfg.grid_step)
-            grid_src = "map_bounds"
+        if cfg.search_boundary is not None:
+            self.grid = grid_from_polygon(cfg.search_boundary, cfg.grid_step, cfg.boundary_margin)
+            grid_src = "search_boundary"
         elif self.map_msg is not None:
             info = self.map_msg.info
             occ = np.array(self.map_msg.data, dtype=np.int8).reshape(info.height, info.width)
             self.grid = grid_from_occupancy(occ, info.resolution, info.origin.position.x,
                                             info.origin.position.y, cfg.grid_step)
             grid_src = cfg.map_topic
-        elif self.now() > cfg.map_wait_timeout:
-            half = cfg.fallback_map_size / 2.0
-            self.get_logger().warn(
-                f"No {cfg.map_topic} received and no map_bounds set. Using a {cfg.fallback_map_size} m "
-                f"square around the start pose.")
-            self.grid = grid_from_bounds(pose[0] - half, pose[0] + half, pose[1] - half, pose[1] + half,
-                                         cfg.grid_step)
-            grid_src = "fallback"
         else:
             self.get_logger().info(f"Waiting for {cfg.map_topic}...", throttle_duration_sec=2.0)
             return False
 
         g = self.grid
-        self.start_pose = pose
-        start_grid_pos = world_to_grid(pose[0], pose[1], g.x_points, g.z_points)
-        src_grid_pos = (world_to_grid(cfg.source_position[0], cfg.source_position[1], g.x_points, g.z_points)
-                        if cfg.source_position is not None else None)
-
-        self.bayesian_agent = TB4BayesianAgent(
-            pos=start_grid_pos,
-            src_pos=src_grid_pos,
-            x_points=g.x_points,
-            z_points=g.z_points,
-            sigma_noise=cfg.sigma_noise,
-            reachable_positions=g.reachable_positions,
-            q_s=cfg.q_s, D=cfg.D, tau=cfg.tau, U=cfg.U, psi_deg=cfg.psi_deg,
-        )
-        self.H_max = map_entropy(self.bayesian_agent.prob_map)
-        self.entropy_threshold = self.H_max * cfg.entropy_frac
+        self.bayesian_agent = BayesianAgent(
+            g.x_points, g.z_points, cfg.sigma_noise, inside=g.inside,
+            q_s=cfg.q_s, D=cfg.D, tau=cfg.tau, U=cfg.U, psi_deg=cfg.psi_deg)
+        H_max = map_entropy(self.bayesian_agent.prob_map)
+        self.entropy_threshold = H_max * cfg.entropy_frac
 
         self.setup_perception()
 
         self.get_logger().info(
             f"Search grid from {grid_src}: x [{g.x_points[0]:.2f}, {g.x_points[-1]:.2f}], "
-            f"y [{g.z_points[0]:.2f}, {g.z_points[-1]:.2f}], {len(g.z_points)}x{len(g.x_points)} cells. "
-            f"Start pose ({pose[0]:.2f}, {pose[1]:.2f}). H_max {self.H_max:.2f} bits, "
-            f"threshold {self.entropy_threshold:.2f} bits ({cfg.entropy_frac * 100:.0f}%).")
+            f"y [{g.z_points[0]:.2f}, {g.z_points[-1]:.2f}], {len(g.z_points)}x{len(g.x_points)} cells, "
+            f"{int(g.inside.sum())} inside the boundary. Start pose ({pose[0]:.2f}, {pose[1]:.2f}). "
+            f"H_max {H_max:.2f} bits, threshold {self.entropy_threshold:.2f} bits ({cfg.entropy_frac * 100:.0f}%).")
+        if cfg.source_position is not None and self.cell_is_outside(*cfg.source_position):
+            self.get_logger().warn(f"Ground-truth source {cfg.source_position} lies outside the search boundary.")
 
         run_info = {
             "controller": type(self).__name__,
@@ -436,13 +398,23 @@ class TB4BaseController(Node):
             "grid_bounds": list(map(float, g.bounds)),
             "x_points": g.x_points.tolist(),
             "z_points(map_y)": g.z_points.tolist(),
-            "H_max": float(self.H_max),
+            "H_max": float(H_max),
             "entropy_threshold": float(self.entropy_threshold),
         }
         run_info.update(self.run_info_extra())
         with open(os.path.join(self.save_dir, "run_config.json"), "w") as f:
             json.dump(run_info, f, indent=2, default=str)
         return True
+
+    def cell_is_outside(self, x, y):
+        """True if the grid cell nearest to map (x, y) is outside the search boundary."""
+        g = self.grid
+        return not g.inside[np.abs(g.z_points - y).argmin(), np.abs(g.x_points - x).argmin()]
+
+    def argmax_xz(self, prob_map):
+        """Map (x, y) of the most likely cell, and its (row, col)."""
+        row, col = np.unravel_index(np.argmax(prob_map), prob_map.shape)
+        return np.array([self.grid.x_points[col], self.grid.z_points[row]]), (row, col)
 
     # ------------------------------------------------------------------
     # Main loop (every sample_period seconds)
@@ -464,7 +436,7 @@ class TB4BaseController(Node):
         if pose is None:
             return
 
-        needed = [("olfaction", self.olfaction_received or cfg.use_simulated_olfaction)]
+        needed = [("olfaction", bool(self.olfaction_raw))]
         if self.uses_camera:
             needed += [("RGB", self.latest_rgb is not None), ("depth", self.latest_depth is not None)]
         missing = [name for name, ok in needed if not ok]
@@ -498,43 +470,27 @@ class TB4BaseController(Node):
     def rescale_concentration(self, raw):
         """Maps a raw reading linearly so olfaction_min_conc -> 0 and olfaction_max_conc -> olfaction_rescale_to."""
         cfg = self.cfg
-        if cfg.olfaction_min_conc is None or cfg.olfaction_max_conc is None:
+        if cfg.olfaction_min_conc is None:
             return raw
         a = cfg.olfaction_rescale_to / (cfg.olfaction_max_conc - cfg.olfaction_min_conc)
         return a * (raw - cfg.olfaction_min_conc)
 
-    def read_olfaction(self, robot_x, robot_z):
-        """Mean olfaction over the current step window.
-
-        Returns dict: raw (mean raw concentration), concentration (rescaled mean),
-        raw_std, n_readings, wind_direction, wind_speed (means).
-        """
-        cfg = self.cfg
-        if cfg.use_simulated_olfaction and cfg.source_position is not None:
-            conc = gaussian_plume(robot_x, robot_z, tuple(cfg.source_position),
-                                  q_s=cfg.q_s, D=cfg.D, U=cfg.U, tau=cfg.tau, psi_deg=cfg.psi_deg)
-            conc += np.random.normal(0, cfg.sigma_noise)
-            return dict(raw=conc, concentration=conc, raw_std=0.0, n_readings=1,
-                        wind_direction=0.0, wind_speed=0.0)
-
+    def read_olfaction(self):
+        """Mean olfaction over the current step window (the latest reading if the window is empty)."""
         window = self.olfaction_raw[self.window_olf_idx:]
-        if window:
-            conc = np.array([r["chemicalConc"] for r in window], dtype=float)
-            raw, raw_std = float(conc.mean()), float(conc.std())
-            wind_dir = float(np.mean([r["wind_direction"] for r in window]))
-            wind_speed = float(np.mean([r["wind_speed"] for r in window]))
-        else:
+        if not window:
             self.get_logger().warn("No /olfaction readings in this step window; using the latest reading.")
-            raw, raw_std = self.olfactionChemicalConc, 0.0
-            wind_dir, wind_speed = self.olfactionWindDirection, self.olfactionWindSpeed
-        return dict(raw=raw, concentration=self.rescale_concentration(raw), raw_std=raw_std,
-                    n_readings=len(window), wind_direction=wind_dir, wind_speed=wind_speed)
+        readings = window or self.olfaction_raw[-1:]
+        conc = np.array([r["chemicalConc"] for r in readings], dtype=float)
+        raw = float(conc.mean())
+        return dict(raw=raw, concentration=self.rescale_concentration(raw), raw_std=float(conc.std()),
+                    n_readings=len(window),
+                    wind_direction=float(np.mean([r["wind_direction"] for r in readings])),
+                    wind_speed=float(np.mean([r["wind_speed"] for r in readings])))
 
     def path_so_far(self, pose):
-        """Robot path: every pose recorded with an /olfaction reading, else the step poses, plus the current pose."""
+        """Robot path: every pose recorded with an /olfaction reading, plus the current pose."""
         pts = [(r["robot_x"], r["robot_z"]) for r in self.olfaction_raw if np.isfinite(r["robot_x"])]
-        if not pts:
-            pts = [(r["robot_x"], r["robot_z"]) for r in self.trajectory_log_list]
         pts.append((pose[0], pose[1]))
         return pts
 
@@ -543,22 +499,22 @@ class TB4BaseController(Node):
         g = self.grid
         step_start_time = time.time()
         step_count = self.step_count
-        robot_x, robot_z, robot_yaw = pose   # robot_z == map y (ai2thor naming); robot_yaw is ROS (rad, CCW from +x)
+        robot_x, robot_z, robot_yaw = pose   # robot_z == map y; robot_yaw is ROS (rad, CCW from +x)
 
-        self.get_logger().info(f"===== Step {step_count + 1}/{cfg.step_threshold} at ({robot_x:.2f}, {robot_z:.2f}) =====")
+        self.get_logger().info(
+            f"===== Step {step_count + 1}/{cfg.step_threshold} at ({robot_x:.2f}, {robot_z:.2f}) =====")
 
         # --- 1. Olfaction: Bayesian update ---
-        olf = self.read_olfaction(robot_x, robot_z)
-        current_odor_concentration, raw_concentration = olf["concentration"], olf["raw"]
-        self.bayesian_agent.posterior(current_odor_concentration, robot_x, robot_z)
+        olf = self.read_olfaction()
+        self.bayesian_agent.posterior(olf["concentration"], robot_x, robot_z)
         srcProbGivenOlfactory = self.bayesian_agent.prob_map
         olfactoryEntropy = map_entropy(srcProbGivenOlfactory)
-
-        max_idx = np.unravel_index(np.argmax(srcProbGivenOlfactory, axis=None), srcProbGivenOlfactory.shape)
-        olfactory_max_xz = grid_to_world(max_idx, g.x_points, g.z_points)
+        olfactory_max_xz, _ = self.argmax_xz(srcProbGivenOlfactory)
 
         # --- 2. Vision / fusion (subclass) ---
         result = self.perceive(pose, step_count, srcProbGivenOlfactory)
+        target_xz = result["target_xz"]
+        self.last_target_xz = target_xz
 
         if step_count == 0:
             behavior_flag = "Initialization"
@@ -568,7 +524,6 @@ class TB4BaseController(Node):
             behavior_flag = "goal_navigation"
 
         # --- 3. Navigation (no-op for now) ---
-        target_xz = result["target_xz"]
         self.navigate(behavior_flag, target_xz, olfactory_max_xz, pose)
 
         # --- 4. Evaluation against ground truth (if known) ---
@@ -576,8 +531,7 @@ class TB4BaseController(Node):
         if cfg.source_position is not None:
             src = np.asarray(cfg.source_position, dtype=float)
             gt_distance = float(np.linalg.norm(np.array([robot_x, robot_z]) - src))
-            if target_xz is not None:
-                target_error = float(np.linalg.norm(src - np.asarray(target_xz, dtype=float)))
+            target_error = float(np.linalg.norm(src - target_xz))
 
         step_time = time.time() - step_start_time
 
@@ -586,14 +540,14 @@ class TB4BaseController(Node):
         panels = [(srcProbGivenOlfactory, rf'$H_C={olfactoryEntropy:.2f}$')] + result["panels"]
         try:
             save_belief_maps(panels, g.x_points, g.z_points, os.path.join(self.save_dir, f"maps_all_{tag}.png"),
-                             trajectory=self.path_so_far(pose))
+                             trajectory=self.path_so_far(pose), boundary=cfg.search_boundary)
         except Exception as e:
             self.get_logger().error(f"Error saving belief map plot at step {step_count}: {e}")
         np.savez_compressed(os.path.join(self.save_dir, f"maps_{step_count:03d}.npz"),
                             olfactory=srcProbGivenOlfactory, x_points=g.x_points, z_points=g.z_points,
-                            **result["arrays"])
+                            inside=g.inside, **result["arrays"])
         try:
-            self.save_perception_outputs(step_count, tag)
+            self.save_perception_outputs(step_count, tag, pose)
         except Exception as e:
             self.get_logger().error(f"Error saving perception outputs at step {step_count}: {e}")
 
@@ -606,14 +560,14 @@ class TB4BaseController(Node):
             "robot_yaw_ros_deg": math.degrees(robot_yaw),     # ROS convention (deg, CCW from map +x)
             "step_time": step_time,
             "behavior_flag": behavior_flag,
-            "is_random": False,
             "target_object": result["target_object"],
-            "target_coordinate": result["target_coordinate"],
+            "target_x": float(target_xz[0]),
+            "target_z": float(target_xz[1]),
             "target_coord_estimation_error": target_error,
             "olfactory_max_x": float(olfactory_max_xz[0]),
             "olfactory_max_z": float(olfactory_max_xz[1]),
-            "concentration": current_odor_concentration,         # rescaled, used by the Bayesian update
-            "raw_concentration": raw_concentration,              # mean over the step window
+            "concentration": olf["concentration"],         # rescaled, used by the Bayesian update
+            "raw_concentration": olf["raw"],               # mean over the step window
             "raw_concentration_std": olf["raw_std"],
             "olfaction_readings": olf["n_readings"],
             "window_start": round(self.window_start, 3),
@@ -629,8 +583,9 @@ class TB4BaseController(Node):
         pd.DataFrame(self.trajectory_log_list).to_csv(os.path.join(self.save_dir, "trajectory_log.csv"), index=False)
 
         self.get_logger().info(
-            f"conc={current_odor_concentration:.2f} (raw mean {raw_concentration:.2f} of {olf['n_readings']}) H_C={olfactoryEntropy:.2f} (thr {self.entropy_threshold:.2f}) "
-            f"flag={behavior_flag} target={result['target_object']} @ {result['target_coordinate']} "
+            f"conc={olf['concentration']:.2f} (raw mean {olf['raw']:.2f} of {olf['n_readings']}) "
+            f"H_C={olfactoryEntropy:.2f} (thr {self.entropy_threshold:.2f}) flag={behavior_flag} "
+            f"target={result['target_object']} @ ({target_xz[0]:.2f}, {target_xz[1]:.2f}) "
             f"olf_max=({olfactory_max_xz[0]:.2f}, {olfactory_max_xz[1]:.2f}) step_time={step_time:.2f}s")
 
         self.step_count += 1
@@ -645,26 +600,12 @@ class TB4BaseController(Node):
         Not implemented yet: the robot is driven manually (keyboard teleop),
         so this deliberately publishes nothing.
 
-        Parameters
-        ----------
-        behavior_flag : str
-            "Initialization", "search" or "goal_navigation" (fusion_controller semantics).
-        target_xz : np.ndarray | None
-            Map (x, y) of the current source estimate: the top navKnowledge
-            object, the fused-map arg-max (dirichlet), or the olfactory
-            arg-max (olfactory-only).
-        olfactory_max_xz : np.ndarray
-            Map (x, y) of the most likely source cell of the Bayesian map.
-        pose : tuple
-            Current robot (x, y, yaw) in the map frame, yaw in the ROS
-            convention (rad, CCW from +x).
-
-        Note: fusion_controller computes headings as atan2(dx, dz) in Unity's
-        left-handed convention (CW from +z). Headings sent to the TB4 must use
-        the ROS convention instead: sOSL_tb4Functions.ros_heading_to().
+        behavior_flag : "Initialization", "search" or "goal_navigation".
+        target_xz : map (x, y) of the source estimate (fused or olfactory arg-max).
+        olfactory_max_xz : map (x, y) of the most likely cell of the Bayesian map.
+        pose : robot (x, y, yaw) in the map frame. Headings sent to the TB4 must
+            use the ROS convention (atan2(dy, dx)), not AI2-THOR's atan2(dx, dz).
         """
-        # TODO: send a Nav2 goal / publish self.cmd_vel_pub toward target_xz
-        # (search: next waypoint toward the target, goal_navigation: go to it).
         return None
 
     # ------------------------------------------------------------------
@@ -679,28 +620,23 @@ class TB4BaseController(Node):
         print(f"Finalizing run after {self.step_count} steps. Saving to {self.save_dir}")
 
         try:
-            if self.trajectory_log_list:
-                pd.DataFrame(self.trajectory_log_list).to_csv(os.path.join(self.save_dir, "trajectory_log.csv"),
-                                                              index=False)
             pd.DataFrame(self.olfaction_raw).to_csv(os.path.join(self.save_dir, "olfaction_raw.csv"), index=False)
         except Exception as e:
-            print(f"Error saving final CSVs: {e}")
+            print(f"Error saving olfaction_raw.csv: {e}")
 
         try:
             self.finalize_perception()
         except Exception as e:
             print(f"Error saving final perception outputs: {e}")
 
-        if self.grid is not None and self.trajectory_log_list:
-            last = self.trajectory_log_list[-1]
-            estimate_xz = None
-            if last["target_coordinate"] not in ('N/A', None):
-                p = parse_position_string(last["target_coordinate"])
-                estimate_xz = (p[0], p[2])
-            plot_tb4_trajectory(
-                os.path.join(self.save_dir, "trajectory_log.csv"), self.grid,
-                os.path.join(self.save_dir, "trajectory_plot.png"),
-                source_xz=self.cfg.source_position, estimate_xz=estimate_xz,
-                plume_params=dict(q_s=self.cfg.q_s, D=self.cfg.D, U=self.cfg.U,
-                                  tau=self.cfg.tau, psi_deg=self.cfg.psi_deg),
-            )
+        if self.trajectory_log_list:
+            cfg = self.cfg
+            try:
+                plot_tb4_trajectory(
+                    os.path.join(self.save_dir, "trajectory_log.csv"), self.grid,
+                    os.path.join(self.save_dir, "trajectory_plot.png"),
+                    source_xz=cfg.source_position, estimate_xz=self.last_target_xz,
+                    plume_params=dict(q_s=cfg.q_s, D=cfg.D, U=cfg.U, tau=cfg.tau, psi_deg=cfg.psi_deg),
+                    boundary=cfg.search_boundary)
+            except Exception as e:
+                print(f"Error saving trajectory plot: {e}")
