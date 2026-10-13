@@ -74,10 +74,11 @@ class TB4FusionController(TB4BaseController):
             f"{table.to_string(index=False)}")
 
         # --- Camera state (written by the sensor callbacks) ---
-        self.latest_rgb = None
-        self.rgb_seq = 0             # incremented per decoded RGB frame, to skip frames already processed
-        self.rgb_frame_id = ""
-        self.latest_depth = None
+        # The callbacks only keep the newest *compressed* message (RGB 10 Hz, depth 30 Hz);
+        # process_frame() decodes the pair it uses, so ~2 frames/s are decoded instead of ~40.
+        self.latest_rgb_msg = None
+        self.rgb_seq = 0             # incremented per RGB message, to skip frames already processed
+        self.latest_depth_msg = None
         self.cam_K = None            # (fx, fy, cx, cy) from CameraInfo
         self.cam_info_size = (0, 0)  # (width, height) of CameraInfo
         self.subscribe(CompressedImage, cfg.rgb_topic, self.image_callback)
@@ -86,6 +87,7 @@ class TB4FusionController(TB4BaseController):
 
         # --- Vision state ---
         self.latest_annotated = None      # shown by ui_update()
+        self.rgb_frame_id = ""            # camera frame of the last processed image (for the TF lookup)
         self.show_window = cfg.show_window
         self.detection_log = []           # every detection, for detections_log.csv
         self._last_frame = None           # (rgb, depth) of the last processed frame
@@ -102,20 +104,11 @@ class TB4FusionController(TB4BaseController):
     # ------------------------------------------------------------------
 
     def image_callback(self, msg: CompressedImage):
-        img = decode_compressed_rgb(msg.data)
-        if img is None:
-            self.get_logger().error("Failed to decode RGB image", throttle_duration_sec=5.0)
-            return
-        self.latest_rgb = img
-        self.rgb_frame_id = msg.header.frame_id
+        self.latest_rgb_msg = msg     # decoded later, only if process_frame() uses it
         self.rgb_seq += 1
 
     def depth_callback(self, msg: CompressedImage):
-        depth = decode_compressed_depth(msg.data, msg.format)
-        if depth is None:
-            self.get_logger().error("Failed to decode depth image", throttle_duration_sec=5.0)
-            return
-        self.latest_depth = depth
+        self.latest_depth_msg = msg
 
     def camera_info_callback(self, msg: CameraInfo):
         k = msg.k   # row-major 3x3: fx at 0, cx at 2, fy at 4, cy at 5
@@ -124,8 +117,8 @@ class TB4FusionController(TB4BaseController):
             self.cam_info_size = (msg.width, msg.height)
 
     def missing_inputs(self):
-        return super().missing_inputs() + [name for name, img in (("RGB", self.latest_rgb),
-                                                                  ("depth", self.latest_depth)) if img is None]
+        return super().missing_inputs() + [name for name, msg in (("RGB", self.latest_rgb_msg),
+                                                                  ("depth", self.latest_depth_msg)) if msg is None]
 
     def camera_intrinsics(self, rgb_shape):
         """(fx, fy, cx, cy) for the RGB image: from CameraInfo, else from camera_hfov_deg."""
@@ -156,7 +149,7 @@ class TB4FusionController(TB4BaseController):
         """Shows the latest annotated frame; runs in the main thread (OpenCV GUI is not thread-safe)."""
         if not self.show_window:
             return
-        frame = self.latest_annotated if self.latest_annotated is not None else self.latest_rgb
+        frame = self.latest_annotated   # blank until the first frame is processed
         if frame is None:
             return
         try:
@@ -176,7 +169,7 @@ class TB4FusionController(TB4BaseController):
         """Processes the newest camera frame (if not processed yet) once the first window has started."""
         if self.done or self.window_start is None:
             return
-        if self.latest_rgb is None or self.latest_depth is None or self.rgb_seq == self._last_seq:
+        if self.latest_rgb_msg is None or self.latest_depth_msg is None or self.rgb_seq == self._last_seq:
             return
         pose = self.get_robot_pose(warn=False)
         if pose is None:
@@ -190,7 +183,16 @@ class TB4FusionController(TB4BaseController):
     def process_frame(self, pose):
         """YOLO -> map-frame detections -> Dirichlet evidence for one frame."""
         cfg = self.cfg
-        rgb, depth = self.latest_rgb.copy(), self.latest_depth.copy()   # callbacks may replace them meanwhile
+        # Take the newest messages (the callbacks may replace them meanwhile) and decode only these two
+        rgb_msg, depth_msg = self.latest_rgb_msg, self.latest_depth_msg
+        rgb = decode_compressed_rgb(rgb_msg.data)
+        depth = decode_compressed_depth(depth_msg.data, depth_msg.format)
+        if rgb is None or depth is None:
+            self.get_logger().error(f"Failed to decode the {'RGB' if rgb is None else 'depth'} image "
+                                    f"(format '{(rgb_msg if rgb is None else depth_msg).format}')",
+                                    throttle_duration_sec=5.0)
+            return
+        self.rgb_frame_id = rgb_msg.header.frame_id
         self._last_frame = (rgb, depth)
         K = self.camera_intrinsics(rgb.shape)
         optical_to_map = self.optical_to_map_fn(pose)
