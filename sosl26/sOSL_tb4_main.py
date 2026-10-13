@@ -42,22 +42,6 @@ def next_run_dir(base_save_dir):
     return run_serial, run_dir
 
 
-def resolve_concentration(value):
-    """A number, or the path of an olfaction_data.csv whose mean chemicalConc (2 decimals) is used."""
-    if value is None or isinstance(value, (int, float)):
-        return value
-    import pandas as pd
-    # Relative paths are tried against the package source dir, then the current directory.
-    candidates = [value] if os.path.isabs(value) else [
-        os.path.join(os.path.dirname(default_save_root()), value), os.path.join(os.getcwd(), value)]
-    path = next((c for c in candidates if os.path.isfile(c)), None)
-    if path is None:
-        raise FileNotFoundError(f"Concentration CSV not found (tried {candidates}); set a number or fix the path.")
-    mean = round(float(pd.read_csv(path)['chemicalConc'].mean()), 2)
-    print(f"Average concentration of {path}: {mean}")
-    return mean
-
-
 # ==========================
 # MAIN FUNCTION
 # ==========================
@@ -70,7 +54,7 @@ def main(args=None):
         odor="burnt",                   # goal phrase: "Is emitting burnt odor:"
         entropy_frac=0.8,               # search -> goal_navigation once H(olfactory map) < 0.8 * H_max
         sample_period=5.0,              # step window (s). Stop the robot; olfaction is averaged over it
-        vision_period=0.5,              # 'F': process a new camera frame at most every 0.5 s
+        vision_period=1.0,              # 'F': process a new camera frame at most every 0.5 s
         step_threshold=20,              # number of steps in a run
         run_time_limit=None,            # seconds, None = until Ctrl+C / 'q'
 
@@ -82,19 +66,19 @@ def main(args=None):
 
         # Rescaling of raw /olfaction readings: min -> 0, max -> 100 (same as the offline a * raw + b).
         # Each can be a number or the path of an olfaction_data.csv, whose mean chemicalConc is used.
-        olfaction_max_conc=resolve_concentration(610),
+        olfaction_max_conc=610,
         # min: dummy value (measured: 'testData/2026-09-15_sensorDump_low/olfaction_data.csv')
-        olfaction_min_conc=resolve_concentration(400),
+        olfaction_min_conc=400,
 
         # Search area: corners (map x, y) in order around the boundary. The grid covers its
         # bounding box, and the source probability is 0 outside it.
         search_boundary=[
             (-7.5, -6.4),    # South East corner
-            (-6.0, -1.0),    # Middle East
-            (-3.0, -1.0),    # Center
-            (0.0, -3.0),     # North East
-            (0.0, 0.0),      # North West
-            (-7.5, -0.7),    # South West
+            (-3.5, -6.4),    # Middle East
+            (-3.5, -3.0),    # checked: Center
+            (0.0, -3.0),     # checked: North East
+            (0.0, 0.0),      # checked: North West
+            (-7.5, 0.0),     # checked: South West
         ],
         boundary_margin=0.0,            # m; cells this close to the boundary also count as inside
         source_position=(-6.4, -0.5),   # ground-truth source (map x, y), for evaluation only (None = unknown)
