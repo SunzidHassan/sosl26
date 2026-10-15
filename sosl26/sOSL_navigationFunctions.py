@@ -9,7 +9,8 @@ The robot only stops at `reachable cells` (map x, y) and faces one of a few
                   view covers the most visual entropy; olfactory-only: the
                   heading facing the source estimate).
 
-The first step is a scan: the robot turns to every heading at its start cell.
+The first step is a scan: the robot drives to its initial position and turns
+to every heading there.
 """
 
 import math
@@ -68,10 +69,3 @@ def heading_towards(headings, from_xy, to_xy, default=None):
         return headings[0] if default is None else default
     bearing = math.atan2(dy, dx)
     return min(headings, key=lambda h: abs(angle_diff(h, bearing)))
-
-
-def scan_order(headings, current_yaw):
-    """All headings, starting with the one closest to current_yaw and turning counter-clockwise."""
-    ccw = sorted(headings, key=lambda h: angle_diff(h, current_yaw) % (2.0 * math.pi))
-    start = min(range(len(ccw)), key=lambda i: abs(angle_diff(ccw[i], current_yaw)))
-    return ccw[start:] + ccw[:start]

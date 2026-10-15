@@ -17,7 +17,8 @@ cfg.headings_wz). The run is a loop driven by step_callback():
                                               3. plan_next_goal(),
                                               4. save the maps and one row of trajectory_log.csv.
 
-The first stops are a scan: the robot turns to every heading at its start cell.
+The first step drives to cfg.initial_position and scans there: the robot
+turns to every heading in cfg.headings_wz order, sampling at each.
 After that each goal is the adjacent reachable cell closest to the source
 estimate, facing choose_heading(). Once the olfactory map is concentrated
 (behavior flag 'goal_navigation') the robot drives to the reachable cell
@@ -51,7 +52,7 @@ from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 
-from sOSL_navigationFunctions import heading_towards, nearest_cell, next_cell, scan_order, wz_from_yaw, yaw_from_wz
+from sOSL_navigationFunctions import heading_towards, nearest_cell, next_cell, wz_from_yaw, yaw_from_wz
 from sOSL_olfactionFunctions import BayesianAgent, map_entropy
 from sOSL_tb4Functions import (
     grid_from_polygon,
@@ -107,7 +108,9 @@ class ExperimentConfig:
 
     # --- Navigation (Nav2) ---
     reachable_cells: Sequence[Tuple[float, float]] = ()   # robot stop positions (map x, y)
-    # Headings as quaternions (w, z) about the vertical axis; (1, 0) faces map +x
+    # Where the first step goes and scans (turns to every heading); None = the reachable cell nearest the robot
+    initial_position: Optional[Tuple[float, float]] = None
+    # Headings as quaternions (w, z) about the vertical axis; (1, 0) faces map +x. The scan uses this order.
     headings_wz: Sequence[Tuple[float, float]] = ((1.0, 0.0), (0.7071, 0.7071), (0.0, 1.0), (0.7071, -0.7071))
     adjacency_radius: float = 1.5              # m; cells this close are adjacent (1.5 = 8-neighbourhood at 1 m)
     nav_action: str = "navigate_to_pose"       # Nav2 NavigateToPose action name
@@ -195,6 +198,9 @@ class TB4BaseController(Node):
         outside = [tuple(c) for c in self.cells if not self.grid.contains(*c)]
         if outside:
             self.get_logger().warn(f"Reachable cells outside the search boundary: {outside}")
+        is_cell = cfg.initial_position is None or np.isclose(self.cells, cfg.initial_position).all(axis=1).any()
+        if not is_cell:
+            self.get_logger().warn(f"initial_position {cfg.initial_position} is not one of the reachable cells.")
 
         # --- State ---
         # 'init' -> 'navigating' -> 'arrived' -> 'sampling' -> 'navigating' -> ... (see module docstring)
@@ -356,11 +362,13 @@ class TB4BaseController(Node):
             if missing:
                 self.get_logger().warn(f"Waiting for: {', '.join(missing)}", throttle_duration_sec=2.0)
                 return
-            # First step: turn to every heading at the start cell, sampling at each
+            # First step: drive to the initial position facing the first heading, then turn
+            # to each of the other headings there; the robot samples at each of these stops.
             self.write_run_config(pose)
-            cell = self.cells[nearest_cell(self.cells, pose[:2])]
-            self.goal_queue = [dict(kind='scan', x=cell[0], y=cell[1], yaw=yaw)
-                               for yaw in scan_order(self.headings, pose[2])]
+            start = (self.cfg.initial_position if self.cfg.initial_position is not None
+                     else self.cells[nearest_cell(self.cells, pose[:2])])
+            self.goal_queue = [dict(kind='scan', x=float(start[0]), y=float(start[1]), yaw=yaw)
+                               for yaw in self.headings]
             self.send_goal(self.goal_queue.pop(0))
             return
 

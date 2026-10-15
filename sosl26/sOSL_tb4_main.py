@@ -92,6 +92,7 @@ def main(args=None):
             (-5, -1), (-5, -2), (-5, -3), (-5, -4), (-5, -5),
             (-6, -1), (-6, -2), (-6, -3), (-6, -4), (-6, -5),
         ],
+        initial_position=(-1, -2),      # first step: Nav2 goal here, then turn to each heading below
         headings_wz=[(0.0, 1.0), (0.7, 0.7), (1.0, 0.0), (0.7, -0.7)],   # quaternion (w, z): 180, 90, 0, -90 deg
         adjacency_radius=1.5,           # m; 1.5 = 8 neighbours (diagonals included) at 1 m spacing
         nav_timeout=120.0,              # s; cancel a goal that takes longer

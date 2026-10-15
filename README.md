@@ -38,9 +38,10 @@ The grid covers its bounding box, and the olfactory, visual and fused source pro
 The robot only stops at `reachable_cells` (map x, y) facing one of `headings_wz` (quaternions `(w, z)`:
 180°, 90°, 0°, -90°). It moves between them with Nav2 `NavigateToPose` goals:
 
-1. **Initial scan (the first step):** at the reachable cell nearest its start pose, the robot turns to each of the
-   4 headings (starting with the one nearest its current heading, then counter-clockwise). It samples and updates the
-   maps at each one, so the scan is 4 steps with `behavior_flag = Initialization`.
+1. **Initial scan (the first step):** the robot drives to `initial_position` (set in `main()`, now (-1, -2)) facing
+   the first heading, then turns to each of the other headings there, in `headings_wz` order (180°, 90°, 0°, -90°).
+   It samples and updates the maps at each one, so the scan is 4 steps with `behavior_flag = Initialization`.
+   With `initial_position = None` it scans at the reachable cell nearest its start pose.
 2. **Search:** after each step the next goal is the cell, among the current cell and its adjacent reachable cells
    (within `adjacency_radius` = 1.5 m, i.e. 8 neighbours including diagonals), closest to the source estimate (the
    fused arg-max; the olfactory arg-max for `'O'`). If no neighbour is closer, the robot stays and only turns.
