@@ -1,17 +1,27 @@
 """Experiment configuration and the olfactory TurtleBot4 controller (ROS 2 Jazzy).
 
 TB4BaseController is the olfactory-only ('O') controller and the base class of
-the fusion ('F') controller in tb4_fusion_controller.py. Each step lasts
-`sample_period` seconds (stop the robot while it samples). At the end of each
-step it:
+the fusion ('F') controller in tb4_fusion_controller.py.
 
-  1. reads the robot pose (TF map -> base_footprint),
-  2. averages all /olfaction readings of the step window and updates the
-     Bayesian source map P(src | C) with that mean,
-  3. calls perceive(): here the estimate is the olfactory arg-max; the fusion
-     controller fuses in vision instead,
-  4. saves the maps and one row of trajectory_log.csv,
-  5. calls navigate(), which is currently a no-op (drive with teleop).
+The robot moves with Nav2 between fixed poses (cfg.reachable_cells x
+cfg.headings_wz). The run is a loop driven by step_callback():
+
+  navigating --(Nav2 result)--> arrived --> sampling (sample_period s, robot still)
+       ^                                        |
+       |                                        v
+       +------------ send next goal <------ run_step():
+                                              1. average the window's /olfaction readings and
+                                                 update the Bayesian source map P(src | C),
+                                              2. perceive(): source estimate (olfactory arg-max;
+                                                 the fusion controller fuses in vision),
+                                              3. plan_next_goal(),
+                                              4. save the maps and one row of trajectory_log.csv.
+
+The first stops are a scan: the robot turns to every heading at its start cell.
+After that each goal is the adjacent reachable cell closest to the source
+estimate, facing choose_heading(). Once the olfactory map is concentrated
+(behavior flag 'goal_navigation') the robot drives to the reachable cell
+closest to the estimate and the run ends; it also ends at step_threshold.
 
 Source probabilities are 0 outside cfg.search_boundary.
 
@@ -30,6 +40,9 @@ import numpy as np
 import pandas as pd
 
 import rclpy
+from action_msgs.msg import GoalStatus
+from nav2_msgs.action import NavigateToPose
+from rclpy.action import ActionClient
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
@@ -38,6 +51,7 @@ from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 
+from sOSL_navigationFunctions import heading_towards, nearest_cell, next_cell, scan_order, wz_from_yaw, yaw_from_wz
 from sOSL_olfactionFunctions import BayesianAgent, map_entropy
 from sOSL_tb4Functions import (
     grid_from_polygon,
@@ -63,7 +77,7 @@ class ExperimentConfig:
     entropy_frac: float = 0.8                  # behavior flag: 'search' until H(P(src | C)) < entropy_frac * H_max
 
     # --- Sampling / run limits ---
-    sample_period: float = 5.0                 # step window (s): olfaction is averaged, vision frames accumulate
+    sample_period: float = 5.0                 # sampling time (s) at each stop: olfaction averaged, frames accumulate
     vision_period: float = 0.5                 # 'F': process a new camera frame at most every vision_period s
     save_vision_frames: bool = True            # 'F': save the annotated YOLO image of every processed frame
     step_threshold: int = 100                  # the run ends after this many steps
@@ -90,6 +104,14 @@ class ExperimentConfig:
     boundary_margin: float = 0.0               # cells within this distance (m) of the boundary count as inside
     grid_step: float = 0.25
     source_position: Optional[Tuple[float, float]] = None           # ground truth (x, y), for evaluation only
+
+    # --- Navigation (Nav2) ---
+    reachable_cells: Sequence[Tuple[float, float]] = ()   # robot stop positions (map x, y)
+    # Headings as quaternions (w, z) about the vertical axis; (1, 0) faces map +x
+    headings_wz: Sequence[Tuple[float, float]] = ((1.0, 0.0), (0.7071, 0.7071), (0.0, 1.0), (0.7071, -0.7071))
+    adjacency_radius: float = 1.5              # m; cells this close are adjacent (1.5 = 8-neighbourhood at 1 m)
+    nav_action: str = "navigate_to_pose"       # Nav2 NavigateToPose action name
+    nav_timeout: float = 120.0                 # s; a goal still running after this is cancelled
 
     # --- Vision ('F' only) ---
     yolo_model_path: str = ""
@@ -155,6 +177,7 @@ class TB4BaseController(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.subscribe(Vector3, cfg.olfaction_topic, self.olfactory_callback)
+        self.nav_client = ActionClient(self, NavigateToPose, cfg.nav_action, callback_group=self.sensor_group)
 
         # --- Search grid and olfactory map (fixed by the boundary) ---
         self.grid = grid_from_polygon(cfg.search_boundary, cfg.grid_step, cfg.boundary_margin)
@@ -164,9 +187,27 @@ class TB4BaseController(Node):
         self.H_max = map_entropy(self.bayesian_agent.prob_map)   # entropy of the uniform prior
         self.entropy_threshold = self.H_max * cfg.entropy_frac
 
+        # --- Navigation poses ---
+        if not cfg.reachable_cells:
+            raise ValueError("Set reachable_cells: the positions the robot may navigate to.")
+        self.cells = np.asarray(cfg.reachable_cells, dtype=float)
+        self.headings = [yaw_from_wz(w, z) for w, z in cfg.headings_wz]   # ROS yaw (rad)
+        outside = [tuple(c) for c in self.cells if not self.grid.contains(*c)]
+        if outside:
+            self.get_logger().warn(f"Reachable cells outside the search boundary: {outside}")
+
         # --- State ---
+        # 'init' -> 'navigating' -> 'arrived' -> 'sampling' -> 'navigating' -> ... (see module docstring)
+        self.state = 'init'
+        self.goal = None             # current goal: dict(kind='scan'|'search'|'goal', x, y, yaw)
+        self.goal_queue = []         # goals planned ahead (the rest of the initial scan)
+        self.goal_sent_time = None
+        self.nav_status = None       # how the last goal ended: 'succeeded', 'aborted', ...
+        self.nav_time = np.nan       # how long it took (s)
+        self._goal_handle = None
+        self._cancel_requested = False
         self.olfaction_raw = []      # every /olfaction message, with the pose at that time
-        self.window_start = None     # start of the current step window (s since start_time); None = not started
+        self.window_start = None     # start of the current sampling window (s since start_time)
         self.window_olf_idx = 0      # index of the window's first reading in olfaction_raw
         self.step_count = 0
         self.trajectory_log_list = []
@@ -175,7 +216,7 @@ class TB4BaseController(Node):
         self.done = False            # set when the run should end; main() then shuts down
         self._finalized = False
 
-        # Polls every 0.1 s; a step runs once its window has lasted sample_period seconds.
+        # Polls every 0.1 s and advances the navigate / sample / update loop.
         self.step_timer = self.create_timer(0.1, self.step_callback, callback_group=self.processing_group)
 
         g = self.grid
@@ -198,8 +239,16 @@ class TB4BaseController(Node):
     # ------------------------------------------------------------------
 
     def missing_inputs(self):
-        """Names of sensors that have not published yet; steps wait until this is empty."""
-        return [] if self.olfaction_raw else ["olfaction"]
+        """Names of sensors / servers not available yet; the run starts once this is empty."""
+        missing = [] if self.olfaction_raw else ["olfaction"]
+        if not self.nav_client.server_is_ready():
+            missing.append(f"Nav2 action '{self.cfg.nav_action}'")
+        return missing
+
+    def choose_heading(self, cell_xy, target_xz):
+        """Heading (ROS yaw) at the next cell: here the one facing the source estimate.
+        The fusion controller picks the view with the most visual entropy instead."""
+        return heading_towards(self.headings, cell_xy, target_xz)
 
     def perceive(self, pose, step_count, srcProbGivenOlfactory):
         """Source estimate for one step: here the olfactory arg-max.
@@ -264,48 +313,147 @@ class TB4BaseController(Node):
     # ------------------------------------------------------------------
 
     def step_callback(self):
-        """Runs a step whenever the current window has lasted sample_period seconds."""
+        """Advances the loop: navigating -> arrived -> sampling -> run_step -> next goal."""
         if self.done:
             return
         cfg = self.cfg
-        if self.window_start is not None and self.now() - self.window_start < cfg.sample_period:
-            return
-
         if cfg.run_time_limit is not None and self.now() > cfg.run_time_limit:
             self.get_logger().info(f"Run time limit {cfg.run_time_limit}s reached. Ending run.")
-            self.done = True
+            self.end_run()
+            return
+
+        if self.state == 'navigating':
+            # Nav2 runs its own recoveries; cancel only if a goal takes far too long.
+            if self.now() - self.goal_sent_time > cfg.nav_timeout and not self._cancel_requested:
+                self.get_logger().warn(f"Goal not reached after {cfg.nav_timeout:.0f}s; cancelling it.")
+                self._cancel_requested = True
+                if self._goal_handle is not None:
+                    self._goal_handle.cancel_goal_async()   # the result callback then reports 'canceled'
+                else:
+                    self.on_goal_done('timeout')
+            return
+
+        if self.state == 'arrived':
+            if self.goal['kind'] == 'goal':
+                self.get_logger().info(f"Reached the final goal ({self.nav_status}). Ending run.")
+                self.done = True
+                return
+            # Robot stopped at a goal: collect sensor data for sample_period seconds
+            self.start_window()
+            self.state = 'sampling'
+            self.get_logger().info(f"Sampling step {self.step_count + 1} for {cfg.sample_period:.1f}s...")
+            return
+
+        if self.state == 'sampling' and self.now() - self.window_start < cfg.sample_period:
             return
 
         pose = self.get_robot_pose()
         if pose is None:
             return
-        missing = self.missing_inputs()
-        if missing:
-            self.get_logger().warn(f"Waiting for: {', '.join(missing)}", throttle_duration_sec=2.0)
-            return
 
-        if self.window_start is None:
-            # Everything is ready: start the first window, so step 1 averages a full window.
+        if self.state == 'init':
+            missing = self.missing_inputs()
+            if missing:
+                self.get_logger().warn(f"Waiting for: {', '.join(missing)}", throttle_duration_sec=2.0)
+                return
+            # First step: turn to every heading at the start cell, sampling at each
             self.write_run_config(pose)
-            self.start_window()
-            self.get_logger().info(f"Sampling step 1 for {cfg.sample_period:.1f}s...")
+            cell = self.cells[nearest_cell(self.cells, pose[:2])]
+            self.goal_queue = [dict(kind='scan', x=cell[0], y=cell[1], yaw=yaw)
+                               for yaw in scan_order(self.headings, pose[2])]
+            self.send_goal(self.goal_queue.pop(0))
             return
 
+        # state == 'sampling' and the window is over: update the maps and plan the next goal
         try:
-            self.run_step(pose)
+            next_goal = self.run_step(pose)
         except Exception:
-            # Keep the run alive (and its data) if a single step fails
+            # Keep the run alive (and its data): sample again at the same place
             self.get_logger().error(f"Step {self.step_count} failed:\n{traceback.format_exc()}")
-        self.start_window()
+            self.start_window()
+            return
 
         if self.step_count >= cfg.step_threshold:
             self.get_logger().info(f"Step threshold {cfg.step_threshold} reached. Ending run.")
             self.done = True
+        else:
+            self.send_goal(next_goal)
 
     def start_window(self):
-        """Starts the next step window: later /olfaction readings belong to the next step."""
+        """Starts a sampling window: only /olfaction readings from now on are averaged."""
         self.window_start = self.now()
         self.window_olf_idx = len(self.olfaction_raw)
+
+    # ------------------------------------------------------------------
+    # Navigation (Nav2 NavigateToPose)
+    # ------------------------------------------------------------------
+
+    def plan_next_goal(self, behavior_flag, target_xz, pose):
+        """Next goal: the rest of the scan, else an adjacent cell towards the source
+        estimate, or (goal_navigation) the reachable cell closest to the estimate."""
+        if self.goal_queue:
+            return self.goal_queue.pop(0)
+        if behavior_flag == "goal_navigation":
+            # Final goal: the reachable cell closest to the estimate, facing it
+            cell = self.cells[nearest_cell(self.cells, target_xz)]
+            yaw = heading_towards(self.headings, cell, target_xz, default=pose[2])
+            return dict(kind='goal', x=cell[0], y=cell[1], yaw=yaw)
+        # The robot may not have reached its goal exactly: plan from the cell it is at
+        idx = next_cell(self.cells, nearest_cell(self.cells, pose[:2]), target_xz, self.cfg.adjacency_radius)
+        cell = self.cells[idx]
+        return dict(kind='search', x=cell[0], y=cell[1], yaw=self.choose_heading(cell, target_xz))
+
+    def send_goal(self, goal):
+        """Sends a NavigateToPose goal; on_goal_done() is called when Nav2 finishes."""
+        self.goal = goal
+        msg = NavigateToPose.Goal()
+        msg.pose.header.frame_id = self.cfg.map_frame
+        msg.pose.header.stamp = self.get_clock().now().to_msg()
+        msg.pose.pose.position.x = float(goal['x'])
+        msg.pose.pose.position.y = float(goal['y'])
+        w, z = wz_from_yaw(goal['yaw'])
+        msg.pose.pose.orientation.w = w
+        msg.pose.pose.orientation.z = z
+        self.state = 'navigating'
+        self.goal_sent_time = self.now()
+        self._goal_handle = None
+        self._cancel_requested = False
+        self.get_logger().info(f"Nav2 goal ({goal['kind']}): ({goal['x']:.2f}, {goal['y']:.2f}), "
+                               f"yaw {math.degrees(goal['yaw']):.0f} deg")
+        self.nav_client.send_goal_async(msg).add_done_callback(self._goal_response_callback)
+
+    def _goal_response_callback(self, future):
+        handle = future.result()
+        if not handle.accepted:
+            self.get_logger().warn("Nav2 rejected the goal.")
+            self.on_goal_done('rejected')
+            return
+        self._goal_handle = handle
+        handle.get_result_async().add_done_callback(self._goal_result_callback)
+
+    def _goal_result_callback(self, future):
+        status = future.result().status
+        names = {GoalStatus.STATUS_SUCCEEDED: 'succeeded', GoalStatus.STATUS_ABORTED: 'aborted',
+                 GoalStatus.STATUS_CANCELED: 'canceled'}
+        self.on_goal_done(names.get(status, f'status_{status}'))
+
+    def on_goal_done(self, status):
+        """Goal finished (reached or not): the next step_callback starts sampling."""
+        self.nav_status = status
+        self.nav_time = self.now() - self.goal_sent_time
+        self._goal_handle = None
+        if status != 'succeeded':
+            self.get_logger().warn(f"Goal {status}; continuing from where the robot is.")
+        self.state = 'arrived'
+
+    def end_run(self):
+        self.stop_navigation()
+        self.done = True
+
+    def stop_navigation(self):
+        """Cancels a running Nav2 goal (called on shutdown)."""
+        if self._goal_handle is not None:
+            self._goal_handle.cancel_goal_async()
 
     def write_run_config(self, start_pose):
         g = self.grid
@@ -366,17 +514,17 @@ class TB4BaseController(Node):
         target_xz = result["target_xz"]
         self.last_target_xz = target_xz
 
-        # Behavior flag (used by navigate() once it exists): keep searching while the
-        # olfactory map is still uncertain, go to the target once it is concentrated.
-        if step_count == 0:
+        # Behavior flag: initial scan, then keep searching while the olfactory map is
+        # still uncertain, and go to the estimate once it is concentrated.
+        if self.goal['kind'] == 'scan':
             behavior_flag = "Initialization"
         elif olfactoryEntropy > self.entropy_threshold:
             behavior_flag = "search"
         else:
             behavior_flag = "goal_navigation"
 
-        # --- 3. Navigation (no-op for now) ---
-        self.navigate(behavior_flag, target_xz, olfactory_max_xz, pose)
+        # --- 3. Next Nav2 goal (sent by step_callback after this step) ---
+        next_goal = self.plan_next_goal(behavior_flag, target_xz, pose)
 
         # --- 4. Evaluation against the ground truth (if known) ---
         gt_distance, target_error = np.nan, np.nan
@@ -413,6 +561,17 @@ class TB4BaseController(Node):
             "robot_yaw_ros_deg": math.degrees(robot_yaw),     # ROS convention (deg, CCW from map +x)
             "step_time": step_time,
             "behavior_flag": behavior_flag,
+            # The goal that brought the robot here, how it ended, and the goal planned next
+            "goal_kind": self.goal['kind'],
+            "goal_x": self.goal['x'],
+            "goal_z": self.goal['y'],
+            "goal_yaw_ros_deg": math.degrees(self.goal['yaw']),
+            "nav_status": self.nav_status,
+            "nav_time": self.nav_time,
+            "next_goal_kind": next_goal['kind'],
+            "next_goal_x": next_goal['x'],
+            "next_goal_z": next_goal['y'],
+            "next_goal_yaw_ros_deg": math.degrees(next_goal['yaw']),
             "target_object": result["target_object"],
             "target_x": float(target_xz[0]),
             "target_z": float(target_xz[1]),
@@ -443,24 +602,7 @@ class TB4BaseController(Node):
             f"olf_max=({olfactory_max_xz[0]:.2f}, {olfactory_max_xz[1]:.2f}) step_time={step_time:.2f}s")
 
         self.step_count += 1
-
-    # ------------------------------------------------------------------
-    # Navigation
-    # ------------------------------------------------------------------
-
-    def navigate(self, behavior_flag, target_xz, olfactory_max_xz, pose):
-        """Moves the robot toward the current source estimate.
-
-        Not implemented yet: the robot is driven manually (keyboard teleop),
-        so this deliberately publishes nothing.
-
-        behavior_flag : "Initialization", "search" or "goal_navigation".
-        target_xz : map (x, y) of the source estimate (fused or olfactory arg-max).
-        olfactory_max_xz : map (x, y) of the most likely cell of the Bayesian map.
-        pose : robot (x, y, yaw) in the map frame. Headings sent to the TB4 must
-            use the ROS convention (atan2(dy, dx)), not AI2-THOR's atan2(dx, dz).
-        """
-        return None
+        return next_goal
 
     # ------------------------------------------------------------------
     # Shutdown
@@ -491,6 +633,6 @@ class TB4BaseController(Node):
                     os.path.join(self.save_dir, "trajectory_plot.png"),
                     source_xz=cfg.source_position, estimate_xz=self.last_target_xz,
                     plume_params=dict(q_s=cfg.q_s, D=cfg.D, U=cfg.U, tau=cfg.tau, psi_deg=cfg.psi_deg),
-                    boundary=cfg.search_boundary)
+                    boundary=cfg.search_boundary, reachable_cells=self.cells)
             except Exception as e:
                 print(f"Error saving trajectory plot: {e}")

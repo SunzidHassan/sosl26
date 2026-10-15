@@ -322,10 +322,10 @@ def save_belief_maps(panels, grid, out_fname, trajectory=None, boundary=None):
 
 
 def plot_tb4_trajectory(trajectory_log_path, grid, save_path, source_xz=None, estimate_xz=None,
-                        plume_params=None, boundary=None):
+                        plume_params=None, boundary=None, reachable_cells=None):
     """Top-down trajectory plot: plume field (if the source is known), cells outside the
-    boundary greyed out, start (lime), end (cyan), source (red star, 1 m circle) and
-    final estimate (yellow X)."""
+    boundary greyed out, reachable cells (white dots), stops (purple), start (lime),
+    end (cyan), source (red star, 1 m circle) and final estimate (yellow X)."""
     df = pd.read_csv(trajectory_log_path)
     min_x, max_x, min_z, max_z = grid.extent()
     fig, ax = plt.subplots(figsize=(6, 6))
@@ -341,6 +341,8 @@ def plot_tb4_trajectory(trajectory_log_path, grid, save_path, source_xz=None, es
     ax.imshow(outside, extent=grid.extent(), origin='lower', zorder=2, alpha=0.5, aspect='auto')
     if boundary is not None:
         draw_boundary(ax, boundary)
+    if reachable_cells is not None:
+        ax.scatter(*np.asarray(reachable_cells).T, color='white', s=15, zorder=3, edgecolors='grey', linewidth=0.5)
 
     if not df.empty:
         ax.plot(df.robot_x, df.robot_z, color='purple', linewidth=1.5, zorder=4)
