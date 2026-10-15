@@ -1,15 +1,19 @@
 """Fusion ('F') TurtleBot4 controller: olfaction + Dirichlet object map.
 
-On top of the olfactory controller (TB4BaseController), YOLO runs throughout
-each step window: every new RGB + depth frame (at most one per
+On top of the olfactory controller (TB4BaseController), YOLO runs while the
+robot samples at a stop: every new RGB + depth frame (at most one per
 `vision_period` s) is detected, projected into the map with the robot pose at
 that moment, and added to the Dirichlet object map
-(sOSL_dirichletFunctions.py). At the end of the step:
+(sOSL_dirichletFunctions.py). No frames are processed while it drives.
+At the end of the sampling window:
 
     P(src | V)     ∝  sum_k p(o_k | z) * max(0, sim(class_k, goal))
     P(src | C, V)  ∝  P(src | C) * P(src | V)
 
 both 0 outside the search boundary. The source estimate is the fused arg-max.
+
+The heading at the next stop is the one whose camera view covers the most
+visual entropy (the least certain part of the object map), see choose_heading().
 """
 
 import math
@@ -94,6 +98,7 @@ class TB4FusionController(TB4BaseController):
         self._last_seq = 0
         self.frame_count = 0              # frames processed in the whole run
         self.step_frames = 0              # frames / detections in the current step window
+        self.hfov = math.radians(cfg.camera_hfov_deg)   # updated from the intrinsics of each frame
         self.step_detections = 0
         # Same callback group as the step timer, so a frame never runs during a step.
         self.vision_timer = self.create_timer(cfg.vision_period, self.vision_callback,
@@ -162,12 +167,12 @@ class TB4FusionController(TB4BaseController):
             self.show_window = False
 
     # ------------------------------------------------------------------
-    # Per-frame vision (runs during the step window)
+    # Per-frame vision (runs while sampling at a stop)
     # ------------------------------------------------------------------
 
     def vision_callback(self):
-        """Processes the newest camera frame (if not processed yet) once the first window has started."""
-        if self.done or self.window_start is None:
+        """Processes the newest camera frame (if not processed yet) while the robot is sampling."""
+        if self.done or self.state != 'sampling':
             return
         if self.latest_rgb_msg is None or self.latest_depth_msg is None or self.rgb_seq == self._last_seq:
             return
@@ -209,8 +214,8 @@ class TB4FusionController(TB4BaseController):
 
         # Camera position / heading and field of view decide which cells were seen
         cam_xz, heading = camera_pose_in_map(optical_to_map)
-        hfov = 2.0 * math.atan(rgb.shape[1] / (2.0 * K[0]))
-        self.object_map.update(detections, cam_xz, heading, hfov, max_range=cfg.depth_range[1])
+        self.hfov = 2.0 * math.atan(rgb.shape[1] / (2.0 * K[0]))
+        self.object_map.update(detections, cam_xz, heading, self.hfov, max_range=cfg.depth_range[1])
 
         t = round(self.now(), 3)
         self.detection_log += [dict(step=self.step_count, frame=self.frame_count, time=t,
@@ -221,6 +226,30 @@ class TB4FusionController(TB4BaseController):
         self.frame_count += 1
         self.step_frames += 1
         self.step_detections += len(detections)
+
+    # ------------------------------------------------------------------
+    # Heading choice (active vision)
+    # ------------------------------------------------------------------
+
+    def choose_heading(self, cell_xy, target_xz):
+        """Heading at the next cell whose camera view covers the most visual entropy.
+
+        Visual entropy of a cell = entropy of its class distribution p(o | z) in the
+        Dirichlet map: highest for cells never seen (uniform prior), low for cells
+        seen many times. A view is the field of view (hfov, up to the max depth)
+        from the cell, inside the search boundary.
+        """
+        entropy = self.object_map.shannon_entropy()
+        inside = self.grid.inside
+
+        def view_entropy(yaw):
+            seen = self.object_map.fov_mask(cell_xy, yaw, self.hfov, self.cfg.depth_range[1]) & inside
+            return float(entropy[seen].sum())
+
+        scores = {yaw: view_entropy(yaw) for yaw in self.headings}
+        self.get_logger().info("View entropy per heading: " + ", ".join(
+            f"{math.degrees(yaw):.0f} deg: {h:.1f}" for yaw, h in scores.items()))
+        return max(scores, key=scores.get)
 
     # ------------------------------------------------------------------
     # Per-step fusion

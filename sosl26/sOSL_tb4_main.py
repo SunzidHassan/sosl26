@@ -2,10 +2,11 @@
 
     ros2 run sosl26 sosl_tb4
 
-Set the experiment parameters in main() below. Drive the robot with keyboard
-teleop (e.g. `ros2 run teleop_twist_keyboard teleop_twist_keyboard`); the
-controller only senses, fuses and logs. Stop with Ctrl+C or 'q' in the
-YOLO window. Results are written to
+Set the experiment parameters in main() below. Needs localization (TF
+map -> base_footprint) and Nav2 running: the controller drives the robot
+between the reachable cells with NavigateToPose goals, samples at each stop,
+and updates the maps. It ends at step_threshold, after the final goal
+navigation, or with Ctrl+C / 'q' in the YOLO window. Results are written to
     <sosl26>/save/save_F_{Odor}_dirichlet/{entropy_frac}/{run}/       (fusion)
     <sosl26>/save/save_O_{Odor}/{entropy_frac}/{run}/                 (olfactory-only)
 """
@@ -53,9 +54,9 @@ def main(args=None):
         alg_choice='F',                 # 'F' fusion (olfaction + Dirichlet vision) | 'O' olfactory-only
         odor="burnt",                   # goal phrase: "Is emitting burnt odor:"
         entropy_frac=0.8,               # search -> goal_navigation once H(olfactory map) < 0.8 * H_max
-        sample_period=5.0,              # step window (s). Stop the robot; olfaction is averaged over it
-        vision_period=1.0,              # 'F': process a new camera frame at most every 0.5 s
-        step_threshold=20,              # number of steps in a run
+        sample_period=5.0,              # sampling time (s) at each stop; olfaction is averaged over it
+        vision_period=1.0,              # 'F': process a new camera frame at most every 1.0 s
+        step_threshold=20,              # number of steps (stops) in a run; the initial scan is 4 of them
         run_time_limit=None,            # seconds, None = until Ctrl+C / 'q'
 
         # Olfactory (Gaussian plume) model
@@ -65,7 +66,6 @@ def main(args=None):
         sigma_noise=100,                # std of the sensor noise, in rescaled units
 
         # Rescaling of raw /olfaction readings: min -> 0, max -> 100 (same as the offline a * raw + b).
-        # Each can be a number or the path of an olfaction_data.csv, whose mean chemicalConc is used.
         olfaction_max_conc=610,
         # min: dummy value (measured: 'testData/2026-09-15_sensorDump_low/olfaction_data.csv')
         olfaction_min_conc=400,
@@ -82,6 +82,20 @@ def main(args=None):
         ],
         boundary_margin=0.0,            # m; cells this close to the boundary also count as inside
         source_position=(-6.4, -0.5),   # ground-truth source (map x, y), for evaluation only (None = unknown)
+
+        # Navigation (Nav2): the robot stops only at these cells (map x, y), facing one of the headings.
+        reachable_cells=[
+            (-1, -1), (-1, -2),
+            (-2, -1), (-2, -2),
+            (-3, -1), (-3, -2),
+            (-4, -1), (-4, -2), (-4, -3), (-4, -4),
+            (-5, -1), (-5, -2), (-5, -3), (-5, -4), (-5, -5),
+            (-6, -1), (-6, -2), (-6, -3), (-6, -4), (-6, -5),
+        ],
+        initial_position=(-1, -2),      # first step: Nav2 goal here, then turn to each heading below
+        headings_wz=[(0.0, 1.0), (0.7, 0.7), (1.0, 0.0), (0.7, -0.7)],   # quaternion (w, z): 180, 90, 0, -90 deg
+        adjacency_radius=1.5,           # m; 1.5 = 8 neighbours (diagonals included) at 1 m spacing
+        nav_timeout=120.0,              # s; cancel a goal that takes longer
 
         # Vision ('F')
         yolo_model_path="models/YOLO/neth234YOLO26m100epoch.pt",
@@ -157,6 +171,7 @@ def main(args=None):
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
+        node.stop_navigation()                # cancel a running Nav2 goal (Ctrl+C / 'q')
         executor.shutdown(timeout_sec=30.0)   # waits for a running step / frame to finish
         node.finalize()                       # end-of-run files, even after Ctrl+C
         node.destroy_node()
