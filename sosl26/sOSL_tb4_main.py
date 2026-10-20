@@ -9,6 +9,7 @@ and updates the maps. It ends at step_threshold, after the final goal
 navigation, or with Ctrl+C / 'q' in the YOLO window. Results are written to
     <sosl26>/save/save_F_{Odor}_dirichlet/{entropy_frac}/{run}/       (fusion)
     <sosl26>/save/save_O_{Odor}/{entropy_frac}/{run}/                 (olfactory-only)
+with a "_dataRecord" suffix on the folder for data-record runs (dataRecord=True).
 """
 
 import os
@@ -63,12 +64,12 @@ def main(args=None):
         q_s=6.48,                       # emission rate
         D=0.004,                        # diffusion coefficient
         tau=1000.0,                     # decay time
-        sigma_noise=100,                # std of the sensor noise, in rescaled units
+        sigma_noise=20,                # std of the sensor noise, in rescaled units
 
         # Rescaling of raw /olfaction readings: min -> 0, max -> 100 (same as the offline a * raw + b).
         olfaction_max_conc=610,
         # min: dummy value (measured: 'testData/2026-09-15_sensorDump_low/olfaction_data.csv')
-        olfaction_min_conc=400,
+        olfaction_min_conc=300,
 
         # Search area: corners (map x, y) in order around the boundary. The grid covers its
         # bounding box, and the source probability is 0 outside it.
@@ -93,6 +94,14 @@ def main(args=None):
             (-6, -1), (-6, -2), (-6, -3), (-6, -4), (-6, -5),
         ],
         initial_position=(-1, -2),      # first step: Nav2 goal here, then turn to each heading below
+
+        # Data-record run: True = visit every record point and sample at every heading (no search).
+        # 10 points x 4 headings = 40 steps; step_threshold is ignored.
+        dataRecord=False,
+        record_points=[
+            (-1, -2), (-2, -2), (-3, -2), (-4, -2), (-5, -2),
+            (-6, -5), (-6, -4), (-6, -3), (-6, -2), (-6, -1.5),
+        ],
         headings_wz=[(0.0, 1.0), (0.7, 0.7), (1.0, 0.0), (0.7, -0.7)],   # quaternion (w, z): 180, 90, 0, -90 deg
         adjacency_radius=1.5,           # m; 1.5 = 8 neighbours (diagonals included) at 1 m spacing
         nav_timeout=120.0,              # s; cancel a goal that takes longer
@@ -138,9 +147,10 @@ def main(args=None):
     if cfg.alg_choice not in ('F', 'O'):
         raise ValueError(f"alg_choice must be 'F' or 'O', got '{cfg.alg_choice}'")
 
-    # save/save_F_Burnt_dirichlet/0.8/<run>/ or save/save_O_Burnt/0.8/<run>/
+    # save/save_F_Burnt_dirichlet[_dataRecord]/0.8/<run>/ or save/save_O_Burnt[_dataRecord]/0.8/<run>/
     odor_tag = re.sub(r"[^A-Za-z0-9]+", "", cfg.odor.title())
-    alg_folder = f"save_{cfg.alg_choice}_{odor_tag}" + ("_dirichlet" if cfg.alg_choice == 'F' else "")
+    alg_folder = (f"save_{cfg.alg_choice}_{odor_tag}" + ("_dirichlet" if cfg.alg_choice == 'F' else "")
+                  + ("_dataRecord" if cfg.dataRecord else ""))
     run_serial, save_dir = next_run_dir(os.path.join(save_root, alg_folder, str(cfg.entropy_frac)))
     print(f"--- STARTING TB4 RUN {run_serial} --- Saving files to: {save_dir}")
 
