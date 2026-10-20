@@ -36,18 +36,7 @@ The grid covers its bounding box, and the olfactory, visual and fused source pro
 ## Navigation (Nav2)
 
 The robot only stops at `reachable_cells` (map x, y) facing one of `headings_wz` (quaternions `(w, z)`:
-180°, 90°, 0°, -90°). Each goal is executed like the survey script:
-
-- **Drive:** a Nav2 `NavigateToPose` goal (`/navigate_to_pose`) to the cell, arriving at the heading. It is skipped if
-  the robot is already within `position_tolerance` (0.25 m), and retried once (`nav_retries`) if it fails.
-- **Turn:** a Nav2 `Spin` goal (`/spin`) by the yaw left to the exact heading (from TF). It is skipped if the robot is
-  within `heading_tolerance` (0.05 rad). Turning in place always uses `Spin`, because `NavigateToPose` to the robot's
-  own position often does not rotate.
-- **Settle:** wait `settle_time` (1.5 s), then sample. Sampling waits (and logs "waiting for") until `/olfaction` and,
-  for `'F'`, the camera have published.
-
-The robot starts moving as soon as the TF pose and both Nav2 action servers are available; it does not wait for
-the sensors. The sequence of goals:
+180°, 90°, 0°, -90°). It moves between them with Nav2 `NavigateToPose` goals:
 
 1. **Initial scan (the first step):** the robot drives to `initial_position` (set in `main()`, now (-1, -2)) facing
    the first heading, then turns to each of the other headings there, in `headings_wz` order (180°, 90°, 0°, -90°).
@@ -62,15 +51,8 @@ the sensors. The sequence of goals:
 3. **Goal navigation:** once the olfactory map is concentrated (entropy below `entropy_frac · H_max`), the robot
    drives to the reachable cell closest to the estimate, facing it, and the run ends.
 
-The run also ends at `step_threshold` steps (stops). A drive or turn that Nav2 aborts or rejects, or a goal that takes
-longer than `nav_timeout`, is logged in `nav_status` / `spin_status`, and the robot samples where it is.
-
-**If the robot does not move**, check the node's log:
-- `Waiting for Nav2 action server(s): ...`: Nav2 (`/navigate_to_pose`, `/spin`) is not running or uses another
-  namespace; set `nav_action` / `spin_action`.
-- `Could not get map->base_footprint`: localization is not running (no TF pose).
-- `NavigateToPose rejected / aborted`: Nav2 refused the goal (e.g. the cell is in an obstacle or its inflation).
-- `Navigating ...: X m and Y deg to go` every 5 s: the goal is running.
+The run also ends at `step_threshold` steps (stops). A goal that Nav2 aborts or rejects, or that takes longer than
+`nav_timeout`, is logged in `nav_status`, and the robot samples where it is.
 
 ## Build and run
 
@@ -79,7 +61,7 @@ pip install ultralytics sentence-transformers
 cd ~/<ws> && colcon build --symlink-install --packages-select sosl26 && source install/setup.bash
 
 # Terminal 1: localization in a saved map (publishes the TF map -> base_footprint)
-# Terminal 2: Nav2 (provides the /navigate_to_pose and /spin actions)
+# Terminal 2: Nav2 (provides the navigate_to_pose action)
 # Terminal 3
 ros2 run sosl26 sosl_tb4
 ```
