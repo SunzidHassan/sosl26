@@ -63,12 +63,12 @@ def main(args=None):
         q_s=6.48,                       # emission rate
         D=0.004,                        # diffusion coefficient
         tau=1000.0,                     # decay time
-        sigma_noise=100,                # std of the sensor noise, in rescaled units
+        sigma_noise=20,                # std of the sensor noise, in rescaled units
 
         # Rescaling of raw /olfaction readings: min -> 0, max -> 100 (same as the offline a * raw + b).
         olfaction_max_conc=610,
         # min: dummy value (measured: 'testData/2026-09-15_sensorDump_low/olfaction_data.csv')
-        olfaction_min_conc=400,
+        olfaction_min_conc=300,
 
         # Search area: corners (map x, y) in order around the boundary. The grid covers its
         # bounding box, and the source probability is 0 outside it.
