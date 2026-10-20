@@ -61,10 +61,10 @@ def main(args=None):
         run_time_limit=None,            # seconds, None = until Ctrl+C / 'q'
 
         # Olfactory (Gaussian plume) model
-        q_s=6.48,                       # emission rate
-        D=0.004,                        # diffusion coefficient
-        tau=1000.0,                     # decay time
-        sigma_noise=20,                # std of the sensor noise, in rescaled units
+        q_s=12612.9,                       # emission rate
+        D=10,                        # diffusion coefficient
+        tau=10.0,                     # decay time
+        sigma_noise=100,                # std of the sensor noise, in rescaled units
 
         # Rescaling of raw /olfaction readings: min -> 0, max -> 100 (same as the offline a * raw + b).
         olfaction_max_conc=610,
@@ -97,10 +97,10 @@ def main(args=None):
 
         # Data-record run: True = visit every record point and sample at every heading (no search).
         # 10 points x 4 headings = 40 steps; step_threshold is ignored.
-        dataRecord=False,
+        dataRecord=True,
         record_points=[
             (-1, -2), (-2, -2), (-3, -2), (-4, -2), (-5, -2),
-            (-6, -5), (-6, -4), (-6, -3), (-6, -2), (-6, -1.5),
+            (-6, -5), (-6, -4), (-6, -3), (-6.5, -2),
         ],
         headings_wz=[(0.0, 1.0), (0.7, 0.7), (1.0, 0.0), (0.7, -0.7)],   # quaternion (w, z): 180, 90, 0, -90 deg
         adjacency_radius=1.5,           # m; 1.5 = 8 neighbours (diagonals included) at 1 m spacing
