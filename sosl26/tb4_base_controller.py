@@ -24,6 +24,11 @@ estimate, facing choose_heading(). Once the olfactory map is concentrated
 (behavior flag 'goal_navigation') the robot drives to the reachable cell
 closest to the estimate and the run ends; it also ends at step_threshold.
 
+Data-record mode (cfg.dataRecord): instead of searching, the robot visits every
+point of cfg.record_points and samples at every heading there, in order
+(len(record_points) x len(headings) steps), then the run ends. The maps are
+still updated and saved at every step.
+
 Source probabilities are 0 outside cfg.search_boundary.
 
 Axis naming (see sOSL_tb4Functions.py): x = ROS map x, z = ROS map y.
@@ -105,6 +110,12 @@ class ExperimentConfig:
     boundary_margin: float = 0.0               # cells within this distance (m) of the boundary count as inside
     grid_step: float = 0.25
     source_position: Optional[Tuple[float, float]] = None           # ground truth (x, y), for evaluation only
+
+    # --- Data-record mode ---
+    # True: visit every record point and sample at every heading (no search); the run
+    # has len(record_points) * len(headings_wz) steps and step_threshold is ignored.
+    dataRecord: bool = False
+    record_points: Sequence[Tuple[float, float]] = ()   # (map x, y), visited in this order
 
     # --- Navigation (Nav2) ---
     reachable_cells: Sequence[Tuple[float, float]] = ()   # robot stop positions (map x, y)
@@ -191,9 +202,11 @@ class TB4BaseController(Node):
         self.entropy_threshold = self.H_max * cfg.entropy_frac
 
         # --- Navigation poses ---
-        if not cfg.reachable_cells:
+        if cfg.dataRecord and not cfg.record_points:
+            raise ValueError("dataRecord needs record_points: the positions to collect data at.")
+        if not cfg.dataRecord and not cfg.reachable_cells:
             raise ValueError("Set reachable_cells: the positions the robot may navigate to.")
-        self.cells = np.asarray(cfg.reachable_cells, dtype=float)
+        self.cells = np.asarray(cfg.reachable_cells or cfg.record_points, dtype=float)
         self.headings = [yaw_from_wz(w, z) for w, z in cfg.headings_wz]   # ROS yaw (rad)
         outside = [tuple(c) for c in self.cells if not self.grid.contains(*c)]
         if outside:
@@ -205,8 +218,8 @@ class TB4BaseController(Node):
         # --- State ---
         # 'init' -> 'navigating' -> 'arrived' -> 'sampling' -> 'navigating' -> ... (see module docstring)
         self.state = 'init'
-        self.goal = None             # current goal: dict(kind='scan'|'search'|'goal', x, y, yaw)
-        self.goal_queue = []         # goals planned ahead (the rest of the initial scan)
+        self.goal = None             # current goal: dict(kind='scan'|'search'|'goal'|'record', x, y, yaw)
+        self.goal_queue = []         # goals planned ahead (the rest of the initial scan / the record run)
         self.goal_sent_time = None
         self.nav_status = None       # how the last goal ended: 'succeeded', 'aborted', ...
         self.nav_time = np.nan       # how long it took (s)
@@ -362,13 +375,20 @@ class TB4BaseController(Node):
             if missing:
                 self.get_logger().warn(f"Waiting for: {', '.join(missing)}", throttle_duration_sec=2.0)
                 return
-            # First step: drive to the initial position facing the first heading, then turn
-            # to each of the other headings there; the robot samples at each of these stops.
             self.write_run_config(pose)
-            start = (self.cfg.initial_position if self.cfg.initial_position is not None
-                     else self.cells[nearest_cell(self.cells, pose[:2])])
-            self.goal_queue = [dict(kind='scan', x=float(start[0]), y=float(start[1]), yaw=yaw)
-                               for yaw in self.headings]
+            if cfg.dataRecord:
+                # Data record: every point, every heading, in order
+                self.goal_queue = [dict(kind='record', x=float(x), y=float(y), yaw=yaw)
+                                   for x, y in cfg.record_points for yaw in self.headings]
+                self.get_logger().info(f"Data-record run: {len(cfg.record_points)} points x "
+                                       f"{len(self.headings)} headings = {len(self.goal_queue)} steps.")
+            else:
+                # First step: drive to the initial position facing the first heading, then turn
+                # to each of the other headings there; the robot samples at each of these stops.
+                start = (cfg.initial_position if cfg.initial_position is not None
+                         else self.cells[nearest_cell(self.cells, pose[:2])])
+                self.goal_queue = [dict(kind='scan', x=float(start[0]), y=float(start[1]), yaw=yaw)
+                                   for yaw in self.headings]
             self.send_goal(self.goal_queue.pop(0))
             return
 
@@ -381,11 +401,20 @@ class TB4BaseController(Node):
             self.start_window()
             return
 
-        if self.step_count >= cfg.step_threshold:
+        if next_goal is None:
+            self.get_logger().info(f"All {self.step_count} record steps done. Ending run.")
+            self.done = True
+        elif not cfg.dataRecord and self.step_count >= cfg.step_threshold:
             self.get_logger().info(f"Step threshold {cfg.step_threshold} reached. Ending run.")
             self.done = True
         else:
             self.send_goal(next_goal)
+
+    def total_steps(self):
+        """Steps in the run: all record steps (data record), else step_threshold."""
+        if self.cfg.dataRecord:
+            return len(self.cfg.record_points) * len(self.headings)
+        return self.cfg.step_threshold
 
     def start_window(self):
         """Starts a sampling window: only /olfaction readings from now on are averaged."""
@@ -398,9 +427,12 @@ class TB4BaseController(Node):
 
     def plan_next_goal(self, behavior_flag, target_xz, pose):
         """Next goal: the rest of the scan, else an adjacent cell towards the source
-        estimate, or (goal_navigation) the reachable cell closest to the estimate."""
+        estimate, or (goal_navigation) the reachable cell closest to the estimate.
+        Data record: the next point / heading, or None when all are done."""
         if self.goal_queue:
             return self.goal_queue.pop(0)
+        if self.cfg.dataRecord:
+            return None
         if behavior_flag == "goal_navigation":
             # Final goal: the reachable cell closest to the estimate, facing it
             cell = self.cells[nearest_cell(self.cells, target_xz)]
@@ -508,7 +540,7 @@ class TB4BaseController(Node):
         robot_x, robot_z, robot_yaw = pose   # robot_z == map y; robot_yaw is ROS (rad, CCW from +x)
 
         self.get_logger().info(
-            f"===== Step {step_count + 1}/{cfg.step_threshold} at ({robot_x:.2f}, {robot_z:.2f}) =====")
+            f"===== Step {step_count + 1}/{self.total_steps()} at ({robot_x:.2f}, {robot_z:.2f}) =====")
 
         # --- 1. Olfaction: Bayesian update with the window mean, at the current pose ---
         olf = self.read_olfaction()
@@ -524,7 +556,9 @@ class TB4BaseController(Node):
 
         # Behavior flag: initial scan, then keep searching while the olfactory map is
         # still uncertain, and go to the estimate once it is concentrated.
-        if self.goal['kind'] == 'scan':
+        if self.goal['kind'] == 'record':
+            behavior_flag = "record"
+        elif self.goal['kind'] == 'scan':
             behavior_flag = "Initialization"
         elif olfactoryEntropy > self.entropy_threshold:
             behavior_flag = "search"
@@ -576,10 +610,10 @@ class TB4BaseController(Node):
             "goal_yaw_ros_deg": math.degrees(self.goal['yaw']),
             "nav_status": self.nav_status,
             "nav_time": self.nav_time,
-            "next_goal_kind": next_goal['kind'],
-            "next_goal_x": next_goal['x'],
-            "next_goal_z": next_goal['y'],
-            "next_goal_yaw_ros_deg": math.degrees(next_goal['yaw']),
+            "next_goal_kind": next_goal['kind'] if next_goal else None,   # None: last record step
+            "next_goal_x": next_goal['x'] if next_goal else np.nan,
+            "next_goal_z": next_goal['y'] if next_goal else np.nan,
+            "next_goal_yaw_ros_deg": math.degrees(next_goal['yaw']) if next_goal else np.nan,
             "target_object": result["target_object"],
             "target_x": float(target_xz[0]),
             "target_z": float(target_xz[1]),

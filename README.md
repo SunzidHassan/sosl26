@@ -54,6 +54,14 @@ The robot only stops at `reachable_cells` (map x, y) facing one of `headings_wz`
 The run also ends at `step_threshold` steps (stops). A goal that Nav2 aborts or rejects, or that takes longer than
 `nav_timeout`, is logged in `nav_status`, and the robot samples where it is.
 
+### Data-record mode
+
+Set `dataRecord=True` in `main()` to collect data at fixed points instead of searching. The robot visits every point of
+`record_points` in order and samples at every heading there (`headings_wz` order), then the run ends:
+10 points × 4 headings = 40 steps (`step_threshold` is ignored). Each stop is a `NavigateToPose` goal like any other.
+All the usual files are saved (`behavior_flag = record`); the folder gets a `_dataRecord` suffix, e.g.
+`save/save_F_Burnt_dirichlet_dataRecord/0.8/<run>/`.
+
 ## Build and run
 
 ```bash
