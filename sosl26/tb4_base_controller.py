@@ -163,9 +163,6 @@ class ExperimentConfig:
     object_positions: Optional[Dict[str, Tuple[float, float]]] = None  # {class: (map x, map y)}
     object_colors: Optional[Dict[str, str]] = None                     # {class: matplotlib color}
 
-    def resolved_goal_phrase(self):
-        return self.goal_phrase or f"Is emitting {self.odor} odor:"
-
 
 # ==========================
 # Olfactory controller (base)
@@ -177,7 +174,9 @@ class TB4BaseController(Node):
         super().__init__(node_name)
         self.cfg = cfg
         self.save_dir = save_dir
-        self.goal_phrase = cfg.resolved_goal_phrase()
+        self.goal_phrase = cfg.goal_phrase
+
+        ## OPTIONAL
         if (cfg.olfaction_min_conc is None) != (cfg.olfaction_max_conc is None):
             raise ValueError("Set both olfaction_min_conc and olfaction_max_conc, or neither.")
         if cfg.olfaction_min_conc is not None and cfg.olfaction_max_conc == cfg.olfaction_min_conc:
@@ -208,6 +207,8 @@ class TB4BaseController(Node):
             raise ValueError("Set reachable_cells: the positions the robot may navigate to.")
         self.cells = np.asarray(cfg.reachable_cells or cfg.record_points, dtype=float)
         self.headings = [yaw_from_wz(w, z) for w, z in cfg.headings_wz]   # ROS yaw (rad)
+
+        ## OPTIONAL
         outside = [tuple(c) for c in self.cells if not self.grid.contains(*c)]
         if outside:
             self.get_logger().warn(f"Reachable cells outside the search boundary: {outside}")
@@ -299,7 +300,7 @@ class TB4BaseController(Node):
         # Every reading is kept with the pose at that moment: the step uses the
         # window mean, and the full list goes to olfaction_raw.csv.
         pose = self.get_robot_pose(warn=False)
-        self.olfaction_raw.append({
+        self.e.append({
             "time": round(self.now(), 3),
             "robot_x": pose[0] if pose else np.nan,
             "robot_z": pose[1] if pose else np.nan,

@@ -54,6 +54,7 @@ def main(args=None):
     cfg = ExperimentConfig(
         alg_choice='F',                 # 'F' fusion (olfaction + Dirichlet vision) | 'O' olfactory-only
         odor="burnt",                   # goal phrase: "Is emitting burnt odor:"
+        goal_phrase=f"Is emitting {self.odor} odor:",
         entropy_frac=0.8,               # search -> goal_navigation once H(olfactory map) < 0.8 * H_max
         sample_period=5.0,              # sampling time (s) at each stop; olfaction is averaged over it
         vision_period=1.0,              # 'F': process a new camera frame at most every 1.0 s
