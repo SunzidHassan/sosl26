@@ -174,7 +174,7 @@ class TB4BaseController(Node):
         super().__init__(node_name)
         self.cfg = cfg
         self.save_dir = save_dir
-        self.goal_phrase = cfg.goal_phrase
+        self.goal_phrase = cfg.goal_phrase or f"Is emitting {cfg.odor} odor:"   # default when not set
 
         ## OPTIONAL
         if (cfg.olfaction_min_conc is None) != (cfg.olfaction_max_conc is None):
@@ -300,7 +300,7 @@ class TB4BaseController(Node):
         # Every reading is kept with the pose at that moment: the step uses the
         # window mean, and the full list goes to olfaction_raw.csv.
         pose = self.get_robot_pose(warn=False)
-        self.e.append({
+        self.olfaction_raw.append({
             "time": round(self.now(), 3),
             "robot_x": pose[0] if pose else np.nan,
             "robot_z": pose[1] if pose else np.nan,
