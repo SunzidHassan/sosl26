@@ -286,11 +286,13 @@ def draw_boundary(ax, polygon):
                          linewidth=1.5, linestyle='--', zorder=3))
 
 
-def save_belief_maps(panels, grid, out_fname, trajectory=None, boundary=None):
+def save_belief_maps(panels, grid, out_fname, trajectory=None, boundary=None, source_circles=None):
     """Saves a row of belief maps (each min-max normalised, 'hot'), e.g. olfactory / visual / fused.
 
     panels : list[(map, title)]
     trajectory : list[(x, z)] robot path, drawn from start (lime) to now (cyan)
+    source_circles : list[(x, z, r)] on the first (olfactory) panel: the likely source distance r
+        around the robot position (x, z) of each step; the last one (this step) is drawn solid
     """
     n = len(panels)
     fig, axes = plt.subplots(1, n, figsize=(4 * n, 5), sharex=True, sharey=True, squeeze=False)
@@ -308,6 +310,15 @@ def save_belief_maps(panels, grid, out_fname, trajectory=None, boundary=None):
             ax.plot(tx, tz, '-', color='cyan', linewidth=1.5, zorder=4)
             ax.plot(tx[0], tz[0], 'o', ms=8, mfc='lime', mec='black', zorder=5)     # start
             ax.plot(tx[-1], tz[-1], 'o', ms=8, mfc='cyan', mec='black', zorder=5)   # current
+        if i == 0 and source_circles:
+            for k, (cx, cz, r) in enumerate(source_circles):
+                if not np.isfinite(r):
+                    continue      # reading too low for the model: no circle
+                current = k == len(source_circles) - 1
+                ax.add_patch(Circle((cx, cz), r, fill=False, zorder=6,
+                                    edgecolor='magenta' if current else 'violet',
+                                    linewidth=2.0 if current else 0.8, linestyle='-' if current else '--',
+                                    alpha=1.0 if current else 0.6))
         ax.set_xlim(extent[0], extent[1])
         ax.set_ylim(extent[2], extent[3])
 
