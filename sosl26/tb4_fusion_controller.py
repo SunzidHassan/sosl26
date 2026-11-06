@@ -273,7 +273,7 @@ class TB4FusionController(TB4BaseController):
         hv, hf = map_entropy(srcProbGivenVision), map_entropy(fused)
         return dict(
             panels=[(srcProbGivenVision, rf'$H_V={hv:.2f}$'), (fused, rf'$H_F={hf:.2f}$')],
-            arrays=dict(visual=srcProbGivenVision, fused=fused, beta=om.beta.astype(np.float32),
+            arrays=dict(visual=srcProbGivenVision, fused=fused, beta=om.masked_beta().astype(np.float32),
                         observed=om.observed, mle_class=om.mle_class()),
             target_object=om.top_object_at(row, col),   # most likely object class in the estimated cell
             target_xz=target_xz,

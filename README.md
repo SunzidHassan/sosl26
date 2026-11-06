@@ -105,12 +105,20 @@ Before the Bayesian update, raw `/olfaction` concentrations are rescaled linearl
 
 `<sosl26>/save/save_F_{Odor}_dirichlet/...` or `save_O_{Odor}/...`, then `{entropy_frac}/{run}/` (with `--symlink-install`; otherwise `./save`):
 
-- `trajectory_log.csv`: one row per step: pose, source estimate (`target_x`, `target_z`), olfaction, wind, the olfactory arg-max, entropies, time, and navigation (`goal_*` and `nav_status` / `nav_time` of the goal that led to this stop, `next_goal_*` planned from it)
-- `maps_all_XXX_x_.._z_...png`: the olfactory, visual `P(src | V)` and fused maps (boundary dashed), plus `maps_XXX.npz` with the raw arrays and the `inside` mask
-- `olfaction_raw.csv` (every `/olfaction` message), `trajectory_plot.png`, `run_config.json`
+- `trajectory_log.csv`: one row per step: pose, source estimate (`target_x`, `target_z`), olfaction, wind, the olfactory arg-max, entropies, time, and navigation (`goal_*` and `nav_status` / `nav_time` of the goal that led to this stop, `next_goal_*` planned from it).
+  `likely_source_distance` is the distance (m) at which the plume model (`q_s`, `D`, `tau`, `U`) predicts the step's
+  rescaled concentration: with Gaussian sensor noise, the source most likely lies on a circle of this radius around
+  the robot. It is NaN when the reading is at or below the model's value at 50 m (e.g. 0 or negative).
+- `maps_all_XXX_x_.._z_...png`: the olfactory, visual `P(src | V)` and fused maps (boundary dashed), plus `maps_XXX.npz` with the raw arrays and the `inside` mask.
+  The olfactory panel shows the likely-source circles: this step's solid magenta, earlier steps' dashed violet.
+- `olfaction_raw.csv` (every `/olfaction` message, with `step` and the controller `state`: only `sampling` readings
+  are averaged into that step's update), `trajectory_plot.png`, `run_config.json`
 - Fusion:
   - `yolo_detections/yolo_{step}_{frame}.jpg` (every processed frame; `save_vision_frames`), `frames/frame_*.png` / `depth/depth_XXX.png` (mm) for the last frame of each step, `detections_log.csv` (every detection).
   - Each step: `object_map_XXX.png` (MLE class map; grey means never observed), plus `beta`, `observed` and `mle_class` in `maps_XXX.npz`.
+  - The object map only takes evidence inside the search boundary (the part of a detection's footprint outside it is
+    dropped). Outside the boundary every saved Dirichlet map is 0: `beta`, posteriors, entropies; `observed` is
+    False and `mle_class` -1.
   - At the end: `dirichlet_final.npz`, `dirichlet_classes.json`, `semantic_similarity_table.csv`, and `dirichlet_maps/` (per-class posteriors, MLE, entropies, semantic likelihood).
 - Olfactory-only: `maps_all_*` has one panel and `maps_XXX.npz` holds only the olfactory map. No frames or detections are saved.
 

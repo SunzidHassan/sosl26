@@ -58,7 +58,7 @@ from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 
 from sOSL_navigationFunctions import heading_towards, nearest_cell, next_cell, wz_from_yaw, yaw_from_wz
-from sOSL_olfactionFunctions import BayesianAgent, map_entropy
+from sOSL_olfactionFunctions import BayesianAgent, likely_source_distance, map_entropy
 from sOSL_tb4Functions import (
     grid_from_polygon,
     plot_tb4_trajectory,
@@ -174,7 +174,7 @@ class TB4BaseController(Node):
         super().__init__(node_name)
         self.cfg = cfg
         self.save_dir = save_dir
-        self.goal_phrase = cfg.goal_phrase
+        self.goal_phrase = cfg.goal_phrase or f"Is emitting {cfg.odor} odor:"   # default when not set
 
         ## OPTIONAL
         if (cfg.olfaction_min_conc is None) != (cfg.olfaction_max_conc is None):
@@ -300,8 +300,12 @@ class TB4BaseController(Node):
         # Every reading is kept with the pose at that moment: the step uses the
         # window mean, and the full list goes to olfaction_raw.csv.
         pose = self.get_robot_pose(warn=False)
-        self.e.append({
+        self.olfaction_raw.append({
             "time": round(self.now(), 3),
+            # Step this reading belongs to, and what the robot was doing: only 'sampling'
+            # readings are averaged into that step's Bayesian update.
+            "step": self.step_count,
+            "state": self.state,
             "robot_x": pose[0] if pose else np.nan,
             "robot_z": pose[1] if pose else np.nan,
             "robot_yaw": ros_yaw_to_ai2thor_deg(pose[2]) if pose else np.nan,
@@ -549,6 +553,9 @@ class TB4BaseController(Node):
         srcProbGivenOlfactory = self.bayesian_agent.prob_map
         olfactoryEntropy = map_entropy(srcProbGivenOlfactory)
         olfactory_max_xz, _ = g.argmax_xz(srcProbGivenOlfactory)
+        # Most likely robot-source distance for this reading under the plume model
+        source_distance = likely_source_distance(olf["concentration"], q_s=cfg.q_s, D=cfg.D, tau=cfg.tau,
+                                                 U=cfg.U, psi_deg=cfg.psi_deg)
 
         # --- 2. Source estimate (olfactory arg-max here, fused with vision in 'F') ---
         result = self.perceive(pose, step_count, srcProbGivenOlfactory)
@@ -582,9 +589,13 @@ class TB4BaseController(Node):
         tag = f"{step_count:03d}_x_{robot_x:.2f}_z_{robot_z:.2f}"
         panels = [(srcProbGivenOlfactory, rf'$H_C={olfactoryEntropy:.2f}$')] + result["panels"]
         path = [(r["robot_x"], r["robot_z"]) for r in self.olfaction_raw if np.isfinite(r["robot_x"])]
+        # Likely-source circles of the previous steps and of this one (olfactory panel)
+        circles = [(r["robot_x"], r["robot_z"], r["likely_source_distance"]) for r in self.trajectory_log_list]
+        circles.append((robot_x, robot_z, source_distance))
         try:
             save_belief_maps(panels, g, os.path.join(self.save_dir, f"maps_all_{tag}.png"),
-                             trajectory=path + [(robot_x, robot_z)], boundary=cfg.search_boundary)
+                             trajectory=path + [(robot_x, robot_z)], boundary=cfg.search_boundary,
+                             source_circles=circles)
         except Exception as e:
             self.get_logger().error(f"Error saving belief map plot at step {step_count}: {e}")
         np.savez_compressed(os.path.join(self.save_dir, f"maps_{step_count:03d}.npz"),
@@ -623,6 +634,9 @@ class TB4BaseController(Node):
             "olfactory_max_z": float(olfactory_max_xz[1]),
             "concentration": olf["concentration"],         # rescaled, used by the Bayesian update
             "raw_concentration": olf["raw"],               # mean over the step window
+            # Distance (m) at which the plume model predicts this concentration: the source most
+            # likely lies on a circle of this radius around the robot (NaN: reading too low)
+            "likely_source_distance": source_distance,
             "raw_concentration_std": olf["raw_std"],
             "olfaction_readings": olf["n_readings"],
             "window_start": round(self.window_start, 3),
@@ -639,7 +653,8 @@ class TB4BaseController(Node):
         pd.DataFrame(self.trajectory_log_list).to_csv(os.path.join(self.save_dir, "trajectory_log.csv"), index=False)
 
         self.get_logger().info(
-            f"conc={olf['concentration']:.2f} (raw mean {olf['raw']:.2f} of {olf['n_readings']}) "
+            f"conc={olf['concentration']:.2f} (raw mean {olf['raw']:.2f} of {olf['n_readings']}, "
+            f"likely source distance {source_distance:.2f} m) "
             f"H_C={olfactoryEntropy:.2f} (thr {self.entropy_threshold:.2f}) flag={behavior_flag} "
             f"target={result['target_object']} @ ({target_xz[0]:.2f}, {target_xz[1]:.2f}) "
             f"olf_max=({olfactory_max_xz[0]:.2f}, {olfactory_max_xz[1]:.2f}) step_time={step_time:.2f}s")

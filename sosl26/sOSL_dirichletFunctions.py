@@ -33,7 +33,9 @@ goal phrase. Background similarity is fixed (0 by default: empty space does
 not emit odor).
 
 The map uses the same SearchGrid (cells, boundary) as the olfactory map, so
-all maps align.
+all maps align. Evidence is only added inside the search boundary, and every
+map it returns or saves (beta, p(o | z), entropies, semantic likelihood) is 0
+outside it.
 """
 
 import json
@@ -195,7 +197,10 @@ class DirichletObjectMap:
             if k is None or k == self.bg_idx:
                 continue   # class not in the map (e.g. excluded)
             radius = float(np.clip(det.get('radius', self.min_radius), self.min_radius, self.max_radius))
-            fp = self.footprint_mask(det['map_x'], det['map_y'], radius)
+            # Only the part of the footprint inside the search boundary gets evidence
+            fp = self.footprint_mask(det['map_x'], det['map_y'], radius) & self.grid.inside
+            if not fp.any():
+                continue   # detection entirely outside the boundary
             xi = float(det['Conf']) * self.conf_temper
 
             # Same class: keep the max confidence per cell instead of summing
@@ -208,7 +213,7 @@ class DirichletObjectMap:
             self.beta += weight_map[..., None] * self.confusion_matrix[k][None, None, :]
 
         # Background: visible cells without a detection, weaker with distance
-        bg_cells = self.fov_mask(cam_xz, heading, hfov, max_range) & ~footprint_union
+        bg_cells = self.fov_mask(cam_xz, heading, hfov, max_range) & ~footprint_union & self.grid.inside
         dist = np.hypot(self.Xc - cam_xz[0], self.Zc - cam_xz[1])
         bg_strength = (1.0 - self.bg_false_neg_rate) / (1.0 + self.bg_dist_decay * dist)
         self.beta[bg_cells, self.bg_idx] += bg_strength[bg_cells]
@@ -220,8 +225,12 @@ class DirichletObjectMap:
     # ------------------------------------------------------------------
 
     def posterior(self):
-        """p(o_k | z_c), shape (H, W, K)."""
-        return self.beta / self.beta.sum(axis=2, keepdims=True)
+        """p(o_k | z_c), shape (H, W, K); 0 outside the search boundary."""
+        return np.where(self.grid.inside[..., None], self.beta / self.beta.sum(axis=2, keepdims=True), 0.0)
+
+    def masked_beta(self):
+        """beta with 0 outside the search boundary (as saved)."""
+        return np.where(self.grid.inside[..., None], self.beta, 0.0)
 
     def mle_class(self):
         """argmax_k p(o_k | z_c); -1 for cells that never received evidence."""
@@ -235,9 +244,11 @@ class DirichletObjectMap:
         return -np.sum(p * np.log(p + 1e-12), axis=2)
 
     def expected_entropy(self):
-        """Expected Shannon entropy under the Dirichlet (Voxeland Eq. 7): also falls as evidence grows."""
+        """Expected Shannon entropy under the Dirichlet (Voxeland Eq. 7): also falls as evidence grows.
+        0 outside the search boundary."""
         a0 = self.beta.sum(axis=2)
-        return digamma(a0 + 1.0) - np.sum(self.beta * digamma(self.beta + 1.0), axis=2) / a0
+        h = digamma(a0 + 1.0) - np.sum(self.beta * digamma(self.beta + 1.0), axis=2) / a0
+        return np.where(self.grid.inside, h, 0.0)
 
     def observed_classes(self):
         """Classes that received any evidence (Background included)."""
@@ -342,7 +353,7 @@ class DirichletObjectMap:
         per-class posteriors, MLE map, entropies and semantic likelihood."""
         g = self.grid
         post = self.posterior()
-        np.savez_compressed(os.path.join(out_dir, 'dirichlet_final.npz'), beta=self.beta.astype(np.float32),
+        np.savez_compressed(os.path.join(out_dir, 'dirichlet_final.npz'), beta=self.masked_beta().astype(np.float32),
                             posterior=post.astype(np.float32), observed=self.observed,
                             x_points=g.x_points, z_points=g.z_points, inside=g.inside)
         with open(os.path.join(out_dir, 'dirichlet_classes.json'), 'w') as f:

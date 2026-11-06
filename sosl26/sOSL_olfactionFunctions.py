@@ -31,6 +31,37 @@ def gaussian_plume(x, z, source, q_s=2000, D=10, U=0, tau=1000, psi_deg=0):
     return q_s / (4 * math.pi * D * r) * np.exp((-del_z * U) / (2 * D) - r / lambd)
 
 
+def likely_source_distance(concentration, q_s=2000, D=10, tau=1000, U=0, psi_deg=0, r_min=0.01, r_max=50.0):
+    """Robot-source distance (m) at which the plume model predicts `concentration`.
+
+    With Gaussian sensor noise this is the most likely distance given one reading: the
+    source lies on a circle of this radius around the robot. The model is evaluated
+    crosswind (exact for U = 0, where the plume is radially symmetric):
+        c(r) = q_s / (4 pi D r) * exp(-r / lambda),  lambda = sqrt(D tau / (1 + tau U^2 / (4 D)))
+    c(r) decreases with r, so the solution is unique. Returns r_min if the reading is above
+    c(r_min), and NaN if it is at or below c(r_max) (e.g. a zero or negative rescaled reading).
+    """
+    psi = math.radians(psi_deg)
+
+    def profile(r):    # crosswind point at distance r: no advection term
+        return float(gaussian_plume(-r * math.sin(psi), r * math.cos(psi), (0.0, 0.0),
+                                    q_s=q_s, D=D, U=U, tau=tau, psi_deg=psi_deg))
+
+    if not np.isfinite(concentration) or concentration <= profile(r_max):
+        return float('nan')
+    if concentration >= profile(r_min):
+        return float(r_min)
+    # Bisection on log r (c(r) is monotonic)
+    lo, hi = math.log(r_min), math.log(r_max)
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        if profile(math.exp(mid)) > concentration:
+            lo = mid
+        else:
+            hi = mid
+    return float(math.exp(0.5 * (lo + hi)))
+
+
 def map_entropy(raw):
     """Shannon entropy (bits) of a non-negative map, after normalising it to sum to 1."""
     p = np.asarray(raw, dtype=float).ravel()
