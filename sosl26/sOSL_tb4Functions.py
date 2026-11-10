@@ -32,7 +32,7 @@ import matplotlib.colors as mcolors  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
-from matplotlib.patches import Circle, Polygon  # noqa: E402
+from matplotlib.patches import Circle, Polygon, Rectangle  # noqa: E402
 from matplotlib.path import Path  # noqa: E402
 from mpl_toolkits.axes_grid1 import make_axes_locatable  # noqa: E402
 from scipy.spatial.transform import Rotation  # noqa: E402
@@ -286,13 +286,15 @@ def draw_boundary(ax, polygon):
                          linewidth=1.5, linestyle='--', zorder=3))
 
 
-def save_belief_maps(panels, grid, out_fname, trajectory=None, boundary=None, source_circles=None):
+def save_belief_maps(panels, grid, out_fname, trajectory=None, boundary=None, source_circles=None,
+                     mark_last_max=False):
     """Saves a row of belief maps (each min-max normalised, 'hot'), e.g. olfactory / visual / fused.
 
     panels : list[(map, title)]
     trajectory : list[(x, z)] robot path, drawn from start (lime) to now (cyan)
     source_circles : list[(x, z, r)] on the first (olfactory) panel: the likely source distance r
         around the robot position (x, z) of each step; the last one (this step) is drawn solid
+    mark_last_max : outline the highest-probability cell of the last panel (e.g. the fused map)
     """
     n = len(panels)
     fig, axes = plt.subplots(1, n, figsize=(4 * n, 5), sharex=True, sharey=True, squeeze=False)
@@ -310,6 +312,11 @@ def save_belief_maps(panels, grid, out_fname, trajectory=None, boundary=None, so
             ax.plot(tx, tz, '-', color='cyan', linewidth=1.5, zorder=4)
             ax.plot(tx[0], tz[0], 'o', ms=8, mfc='lime', mec='black', zorder=5)     # start
             ax.plot(tx[-1], tz[-1], 'o', ms=8, mfc='cyan', mec='black', zorder=5)   # current
+        if mark_last_max and i == n - 1:
+            (mx, mz), _ = grid.argmax_xz(raw)
+            h = grid.step / 2.0
+            ax.add_patch(Rectangle((mx - h, mz - h), grid.step, grid.step, fill=False,
+                                   edgecolor='blue', linewidth=2.5, zorder=7))
         if i == 0 and source_circles:
             for k, (cx, cz, r) in enumerate(source_circles):
                 if not np.isfinite(r):

@@ -595,7 +595,9 @@ class TB4BaseController(Node):
         try:
             save_belief_maps(panels, g, os.path.join(self.save_dir, f"maps_all_{tag}.png"),
                              trajectory=path + [(robot_x, robot_z)], boundary=cfg.search_boundary,
-                             source_circles=circles)
+                             source_circles=circles,
+                             # 'F' (search and data record): outline the most likely cell of the fused map
+                             mark_last_max='fused' in result["arrays"])
         except Exception as e:
             self.get_logger().error(f"Error saving belief map plot at step {step_count}: {e}")
         np.savez_compressed(os.path.join(self.save_dir, f"maps_{step_count:03d}.npz"),
