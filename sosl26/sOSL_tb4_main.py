@@ -62,15 +62,15 @@ def main(args=None):
         run_time_limit=None,            # seconds, None = until Ctrl+C / 'q'
 
         # Olfactory (Gaussian plume) model
-        q_s=12612.9,                       # emission rate
+        q_s=10000,                       # emission rate
         D=10,                        # diffusion coefficient
         tau=10.0,                     # decay time
         sigma_noise=100,                # std of the sensor noise, in rescaled units
 
         # Rescaling of raw /olfaction readings: min -> 0, max -> 100 (same as the offline a * raw + b).
-        olfaction_max_conc=610,
+        olfaction_max_conc=550,
         # min: dummy value (measured: 'testData/2026-09-15_sensorDump_low/olfaction_data.csv')
-        olfaction_min_conc=300,
+        olfaction_min_conc=420,
 
         # Search area: corners (map x, y) in order around the boundary. The grid covers its
         # bounding box, and the source probability is 0 outside it.
@@ -98,7 +98,7 @@ def main(args=None):
 
         # Data-record run: True = visit every record point and sample at every heading (no search).
         # 10 points x 4 headings = 40 steps; step_threshold is ignored.
-        dataRecord=True,
+        dataRecord=False,
         record_points=[
             (-1, -2), (-2, -2), (-3, -2), (-4, -2), (-5, -2),
             (-6, -5), (-6, -4), (-6, -3), (-6.5, -2),
