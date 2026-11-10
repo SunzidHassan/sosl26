@@ -111,6 +111,7 @@ Before the Bayesian update, raw `/olfaction` concentrations are rescaled linearl
   the robot. It is NaN when the reading is at or below the model's value at 50 m (e.g. 0 or negative).
 - `maps_all_XXX_x_.._z_...png`: the olfactory, visual `P(src | V)` and fused maps (boundary dashed), plus `maps_XXX.npz` with the raw arrays and the `inside` mask.
   The olfactory panel shows the likely-source circles: this step's solid magenta, earlier steps' dashed violet.
+  In fusion runs (search and data record) the most likely cell of the fused map is outlined in blue.
 - `olfaction_raw.csv` (every `/olfaction` message, with `step` and the controller `state`: only `sampling` readings
   are averaged into that step's update), `trajectory_plot.png`, `run_config.json`
 - Fusion:
